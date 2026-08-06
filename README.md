@@ -1,85 +1,59 @@
-# Ray Render Farm 🌀
+# RL on Ray & GKE: GRPO Alignment Loop 🌀
 
-Distributed **Mandelbrot rendering** on **KubeRay / GKE**. Pick a region, hit
-**Launch**, and watch the image paint in tile-by-tile as Ray fans the work out
-across the cluster — while a live **cluster map** shows KubeRay autoscaling
-worker pods onto **Spot nodes** and draining them when idle. Each tile is
-labelled with the **pod that computed it**, and an **Open Ray Dashboard** button
-links to the real Ray UI.
+Distributed **GRPO (Group Relative Policy Optimization)** reinforcement learning alignment loop on **KubeRay / GKE**. Pick a model, set the training hyperparameters, hit **Start**, and watch the model learn to solve grade-school arithmetic problems from the `GSM8K` dataset in real time—while a live **metrics dashboard** shows the loss decreasing and rewards (accuracy) climbing as Ray autoscales GPU worker pods onto **Spot L4 GPU nodes**.
 
-This is a [gke_all](https://github.com/ragoler/gke_all) showcase feature
-(`feature.yaml`). It runs **standalone** and as a **Hub feature**. See
-[PROPOSAL.md](PROPOSAL.md) for the full design.
+This is a [gke_all](https://github.com/ragoler/gke_all) showcase feature (`feature.yaml`). It runs **standalone** and as a **Hub feature**. See [DASHBOARD.md](DASHBOARD.md) for live training metrics and GRPO advantage analysis.
 
 ## How it works
 
 ```
-Browser ──/render──▶ Controller (Ray driver) ──ray://head:10001──▶ RayCluster
-   ▲                       │  one @ray.remote task per tile             head +
-   │  SSE: tiles +         │  ray.wait() collects results          autoscaling
-   └─ pod attribution ◀────┘  each task returns its POD_NAME       Spot workers
+Browser ──/start──▶ Controller (Ray driver) ──ray://head:10001──▶ RayCluster
+   ▲                       │  runs GRPO step by step                    head +
+   │  SSE: metrics +       │  ray.remote executes GPU rollouts     autoscaling
+   └─ logs stream ◀────────┘  advantage updates model parameters   Spot workers
 ```
 
-- **Fan-out:** one Ray task per image tile; Ray schedules them across workers.
-- **Autoscaling:** too many pending tasks → the Ray autoscaler asks KubeRay for
-  more worker pods → KubeRay schedules them on Spot nodes (a `ComputeClass`).
-- **Attribution:** each worker pod gets `POD_NAME` via the downward API; tasks
-  return it, so every tile knows which pod made it.
-- **Streaming:** the controller (the driver) streams completed tiles to the
-  browser over SSE; the canvas paints each tile as it lands.
+- **Distributed Rollouts:** multiple trajectories (group size $G$) are sampled in parallel on GPU worker nodes for each question.
+- **Autoscaling:** KubeRay automatically requests Spot GPU nodes from GKE Node Auto-Provisioning (NAP) to handle the GPU Actor workload, scaling back to zero nodes when training goes idle.
+- **GRPO Advantages:** computes relative advantages within the rollout group to reinforce correct logical paths and penalize incorrect ones without requiring a separate critic network.
+- **Streaming:** the controller streams steps, completions, loss, and rewards in real time to the browser over Server-Sent Events (SSE).
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `feature.yaml` | Hub descriptor |
-| `app/` | controller (FastAPI driver) + `render_tile` task + Dockerfile |
-| `frontend/` | playroom: canvas, cluster map, dashboard button |
-| `hub_router.py` | thin Hub data-plane router + full MOCK mode |
-| `infra/` | per-namespace: RayCluster, controller, RBAC, Gateway, HTTPRoute |
-| `cluster/` | cluster-scoped: KubeRay operator (pinned) + Spot ComputeClass |
-| `.env.example` | standalone config template (`cp .env.example .env`) |
-| `setup_infra.sh` | standalone: create GKE cluster + cluster-scoped prereqs |
-| `deploy_app.sh` | standalone: build/push image + deploy `infra/` |
-| `verify_setup.sh` | standalone: readiness + data-plane smoke test |
-| `tests/` | unit + mock-mode tests |
-
-## Run the playroom offline (MOCK)
-
-No cluster needed — the `hub_router` serves a deterministic render with a
-synthetic autoscaling curve (real PNG tiles via a stdlib encoder).
-
-```bash
-python -m venv .venv && . .venv/bin/activate
-pip install fastapi uvicorn
-MODE=MOCK uvicorn serve_mock:app --reload --port 8080
-open http://localhost:8080/ray/
-```
+| `app/` | FastAPI controller backend, training task script, requirements, and dataset builder |
+| `frontend/` | playroom UI: controls, parameter selection, metrics charts, and live logging |
+| `hub_router.py` | Hub data-plane router for Hub dashboard integration |
+| `infra/` | per-namespace: RayCluster, controller, HTTPRoute, Gateway, and BackendPolicies |
+| `cluster/` | cluster-scoped: KubeRay operator + Spot GPU ComputeClass |
+| `.env.example` | standalone configuration template (`cp .env.example .env`) |
+| `setup_infra.sh` | standalone: create GKE cluster + NAP configs + cluster-scoped CRDs |
+| `deploy_app.sh` | standalone: build/push container image + deploy `infra/` manifests |
+| `verify_setup.sh` | standalone: isolated KUBECONFIG setup + readiness smoke tests |
+| `tests/` | unit tests |
 
 ## Standalone on GKE
 
-Three steps, mirroring the `inference_gateway` convention: configure, provision
-the cluster, deploy the app.
+Three steps, mirroring the showcase convention: configure, provision the cluster, deploy the app.
 
 ```bash
 # 1. Configure (edit PROJECT_ID, cluster name, region, worker cap, …)
 cp .env.example .env
 
 # 2. Provision: create the GKE cluster (Gateway API + Node Auto-Provisioning)
-#    and the cluster-scoped prereqs (KubeRay operator + Spot ComputeClass).
+#    and the cluster-scoped prereqs (KubeRay operator + Spot GPU ComputeClass).
 ./setup_infra.sh
 
 # 3. Build & push the image, then deploy the RayCluster + controller + Gateway.
 ./deploy_app.sh
 
-# 4. Validate: readiness + a real render through the Gateway IP.
+# 4. Validate: check readiness and trigger training via the Gateway IP.
 ./verify_setup.sh
 ```
 
-Then open the **Gateway IP in a browser** — the controller serves the full
-playroom (canvas + cluster map) standalone, calling its own API same-origin. The
-Ray Dashboard is at the `ray-dashboard` Service's external IP (printed by the
-scripts). As a Hub feature, the Hub serves the same playroom at `/ray/` instead.
+Then open the **Gateway IP in a browser** (default serves the playroom UI standalone). The Ray Dashboard is at the `ray-dashboard` Service's external IP. Standalone uses **`PROJECT_ID`** (in `.env`); the Hub injects the equivalent as **`PROJECT_NAME`** and supplies `NAMESPACE`/`REGION`/`ARTIFACT_REGISTRY_REPO` itself.
 
 Teardown (the cluster is only removed with `--delete-cluster`):
 
@@ -88,26 +62,11 @@ Teardown (the cluster is only removed with `--delete-cluster`):
 ./setup_infra.sh --delete-cluster  # the above, plus delete the GKE cluster
 ```
 
-Standalone uses **`PROJECT_ID`** (in `.env`); the Hub injects the equivalent as
-**`PROJECT_NAME`** and supplies `NAMESPACE`/`REGION`/`ARTIFACT_REGISTRY_REPO`
-itself. As a Hub feature none of these scripts run — the Hub discovers
-`feature.yaml`, builds the image from its `build:` entry, applies `cluster/` once
-at bootstrap and `infra/` per deploy (into `gke-showcase-ray`), and serves the
-playroom at `/ray/`.
-
 ## Metrics — Google Managed Prometheus (GMP)
 
-Ray exports Prometheus metrics on each pod (`metrics` port `:8080/metrics`). The
-RayCluster exposes that port, and [`infra/podmonitoring.yaml`](infra/podmonitoring.yaml)
-tells **GMP's managed collection** (enabled on the cluster by `setup_infra.sh`
-via `--enable-managed-prometheus`) to scrape every Ray pod — no self-managed
-Prometheus. This follows the
-[KubeRay GMP exporter guide](https://cloud.google.com/stackdriver/docs/managed-prometheus/exporters/kuberay).
+Ray exports Prometheus metrics on each pod (`metrics` port `:8080/metrics`). The RayCluster exposes that port, and [`infra/podmonitoring.yaml`](infra/podmonitoring.yaml) tells **GMP's managed collection** to scrape every Ray pod.
 
-`deploy_app.sh` also creates a curated **Cloud Monitoring dashboard** ("Ray Render
-Farm", from [`monitoring/ray-dashboard.json`](monitoring/ray-dashboard.json)) and
-stashes its URL in the `ray-links` ConfigMap, which the controller surfaces as the
-**"Metrics ↗"** button in the playroom (and the script prints the link too).
+`deploy_app.sh` also creates a curated **Cloud Monitoring dashboard** ("RL on Ray", from [`monitoring/ray-dashboard.json`](monitoring/ray-dashboard.json)) and stashes its URL in the `ray-links` ConfigMap, which the controller surfaces as the **"Metrics ↗"** button in the playroom.
 
 Or query directly in **Cloud Console → Monitoring → Metrics Explorer** (PromQL):
 
@@ -116,11 +75,6 @@ ray_node_cpu_utilization
 sum(ray_tasks{State="RUNNING"})
 ray_cluster_active_nodes
 ```
-
-> The **Ray Dashboard's own "Metrics" tab** additionally needs Grafana +
-> `RAY_PROMETHEUS_HOST`/`RAY_GRAFANA_HOST` on the head. That's a further step
-> (deploy the GMP query frontend + Grafana); GMP collection above is independent
-> and works on its own via Cloud Monitoring.
 
 ## Tests
 
