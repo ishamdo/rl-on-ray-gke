@@ -1,14 +1,7 @@
-"""FastAPI controller for the Ray Render Farm demo.
+"""FastAPI controller and driver for the Ray RL Training loop.
 
-This process is the **Ray driver**. It connects to the in-namespace RayCluster
-head with the Ray Client (``ray://ray-head:10001``), launches one task per image
-tile, and streams completed tiles to the browser over Server-Sent Events as the
-``ray.wait`` loop collects them. A separate ``/workers`` endpoint lists the Ray
-worker pods (via the Kubernetes API) so the frontend can draw the autoscaling
-cluster map.
-
-Data-plane only: the browser calls this directly via the Gateway IP, so CORS is
-mandatory. The Hub's JWT-protected control plane lives in ``hub_router.py``.
+Exposes endpoints to trigger Custom GRPO or veRL PPO/GRPO training on the GKE Ray cluster,
+stream logs, view metrics history, and query active worker nodes for the dashboard.
 """
 
 from __future__ import annotations
@@ -17,6 +10,8 @@ import json
 import os
 import pathlib
 import queue
+import re
+import subprocess
 import threading
 import time
 import uuid
@@ -27,26 +22,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from tasks import build_tile_specs, render_tile
-
 # --------------------------------------------------------------------------- #
-# Configuration (all namespace-portable; nothing hardcodes "default").
+# Configuration (namespace-portable; defaults from env).
 # --------------------------------------------------------------------------- #
 RAY_ADDRESS = os.environ.get("RAY_ADDRESS", "ray://ray-head:10001")
 POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "default")
-RAY_CLUSTER_NAME = os.environ.get("RAY_CLUSTER_NAME", "ray-render-farm")
-TILE_PX = int(os.environ.get("TILE_PX", "128"))
+RAY_CLUSTER_NAME = os.environ.get("RAY_CLUSTER_NAME", "dolev-rl-ray-cluster")
+DEFAULT_MODEL = os.environ.get("RL_MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 
-# Curated regions of the Mandelbrot set. (center_x, center_y, zoom-half-width).
-PRESETS: dict[str, tuple[float, float, float]] = {
-    "overview": (-0.5, 0.0, 1.6),
-    "seahorse": (-0.745, 0.113, 0.02),
-    "spiral": (-0.7435, 0.1314, 0.0035),
-    "elephant": (0.275, 0.007, 0.02),
-    "minibrot": (-1.7687, 0.0017, 0.004),
-}
-
-app = FastAPI(title="Ray Render Farm Controller")
+app = FastAPI(title="Ray RL Demo Controller")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,11 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the playroom UI ourselves so the feature is fully functional STANDALONE
-# (the Hub serves the same UI at /<slug>/, but standalone there is no Hub). The
-# UI calls its own API same-origin (its /api/features/ray/config probe 404s here
-# and it falls back to LIVE against this origin). Mirrors the Hub static layout
-# (/static/features/ray/...) so index.html's asset paths resolve in both.
+# Serve playroom static files same-origin (standalone UI)
 _FRONTEND = pathlib.Path(__file__).resolve().parent / "frontend"
 if _FRONTEND.is_dir():
     app.mount(
@@ -73,117 +53,285 @@ if _FRONTEND.is_dir():
 
     @app.middleware("http")
     async def _no_cache_ui(request, call_next):
-        # Don't let browsers serve stale playroom assets after a redeploy.
         resp = await call_next(request)
         if request.url.path == "/" or request.url.path.startswith("/static/"):
             resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
 
-# In-flight jobs: job_id -> {"queue": Queue, "tiles": int, "started": float}.
-_JOBS: dict[str, dict] = {}
+# --------------------------------------------------------------------------- #
+# Training state
+# --------------------------------------------------------------------------- #
+_TRAINING_ACTIVE = False
+_TRAINING_THREAD = None
+_STATUS = "idle"  # idle, starting, training, error
+_ERROR = None
+_TRAINER_ACTOR = None
+
+_METRICS = {
+    "steps": [],
+    "loss": [],
+    "reward": [],
+}
+_LOGS = []
+_STATE_LOCK = threading.Lock()
+
 _RAY_READY = False
 _RAY_LOCK = threading.Lock()
 
 
 def _ensure_ray() -> None:
-    """Ensure a LIVE Ray Client connection, reconnecting if it dropped.
-
-    The Ray Client connection can die (head restart, Spot churn, idle blip). A
-    cached "connected" flag would then make every render fail with 503, so we
-    probe liveness each time and reconnect transparently.
-    """
+    """Ensure a live connection to the Ray Cluster."""
     global _RAY_READY
     import ray
 
     with _RAY_LOCK:
         if _RAY_READY:
             try:
-                ray.cluster_resources()  # cheap liveness probe
+                ray.cluster_resources()
                 return
             except Exception:
-                _RAY_READY = False  # connection died — fall through to reconnect
+                _RAY_READY = False
 
         try:
             ray.shutdown()
         except Exception:
             pass
         ray.init(address=RAY_ADDRESS, ignore_reinit_error=True)
-        ray.cluster_resources()  # confirm the head is actually reachable
+        ray.cluster_resources()
         _RAY_READY = True
 
 
-def _mark_ray_down() -> None:
-    global _RAY_READY
-    with _RAY_LOCK:
-        _RAY_READY = False
+def prepare_verl_dataset() -> str:
+    """Reads local GSM8K JSON dataset and writes a parquet file for veRL ingestion."""
+    import pandas as pd
+    src = os.path.join(os.path.dirname(__file__), "gsm8k_train.json")
+    with open(src, "r") as f:
+        data = json.load(f)
+        
+    records = []
+    for item in data:
+        records.append({
+            "prompt": item["question"],
+            "ability": "math",
+            "answer": item["answer"]
+        })
+        
+    df = pd.DataFrame(records)
+    dst = os.path.join(os.path.dirname(__file__), "verl_gsm8k_train.parquet")
+    df.to_parquet(dst)
+    return dst
 
 
-def _prewarm_ray() -> None:
-    """Background: connect (and keep reconnecting) so the first render is fast."""
-    while True:
-        try:
-            _ensure_ray()
-        except Exception:
-            pass
-        time.sleep(30)
+def _run_verl(model_name: str, lr: float, batch_size: int, group_size: int) -> None:
+    global _TRAINING_ACTIVE, _STATUS, _ERROR, _METRICS, _LOGS
+    
+    with _STATE_LOCK:
+        _STATUS = "starting"
+        _ERROR = None
+        _LOGS.append(f"[{time.strftime('%X')}] Preparing veRL dataset parquet file...")
+
+    try:
+        parquet_file = prepare_verl_dataset()
+        
+        with _STATE_LOCK:
+            _LOGS.append(f"[{time.strftime('%X')}] Connecting to Ray Cluster at {RAY_ADDRESS}...")
+            _LOGS.append(f"[{time.strftime('%X')}] Launching veRL PPO/GRPO Trainer on GKE L4 GPUs...")
+            
+        cmd = [
+            "python3", "-m", "verl.trainer.main_ppo",
+            f"data.train_files={parquet_file}",
+            f"data.val_files={parquet_file}",
+            f"actor_rollout_ref.model.path={model_name}",
+            f"actor_rollout_ref.actor.optim.lr={lr}",
+            "actor_rollout_ref.model.use_remove_padding=True",
+            f"actor_rollout_ref.actor.ppo_mini_batch_size={batch_size}",
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size=1",
+            "actor_rollout_ref.rollout.generator_type=vllm", 
+            f"actor_rollout_ref.rollout.n={group_size}",
+            "actor_rollout_ref.ref.log_prob_micro_batch_size=1",
+            "algorithm.adv_estimator=grpo",
+            "algorithm.kl_ctrl.kl_coef=0.001",
+            "trainer.logger=['console']",
+            "trainer.project_name=dolev_rl_ray",
+            "trainer.experiment_name=gsm8k",
+            "trainer.n_gpus_per_node=1",
+            "trainer.nnodes=1",
+            "trainer.max_epochs=1",
+            "trainer.total_training_steps=50"
+        ]
+
+        # Injects current Ray address environment variable
+        env = dict(os.environ)
+        env["RAY_ADDRESS"] = RAY_ADDRESS
+        
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
+        with _STATE_LOCK:
+            _STATUS = "training"
+
+        # Regex matching patterns for veRL logs metrics:
+        # e.g., step:1 - timing/gen:1.450 - actor/policy_loss:0.1250 - actor/total_reward:0.4500
+        step_pattern = re.compile(r'step:(\d+)')
+        loss_pattern = re.compile(r'actor/policy_loss:(-?\d+(?:\.\d+)?)')
+        reward_pattern = re.compile(r'(?:actor/total_reward|val/test_score/openai/gsm8k):(-?\d+(?:\.\d+)?)')
+
+        for line in iter(proc.stdout.readline, ""):
+            # Check if training was stopped from UI
+            with _STATE_LOCK:
+                if not _TRAINING_ACTIVE:
+                    proc.terminate()
+                    break
+
+            line_str = line.strip()
+            if not line_str:
+                continue
+
+            with _STATE_LOCK:
+                _LOGS.append(line_str)
+                if len(_LOGS) > 300:
+                    _LOGS = _LOGS[-300:]
+
+            # Parse metrics
+            s_match = step_pattern.search(line_str)
+            l_match = loss_pattern.search(line_str)
+            r_match = reward_pattern.search(line_str)
+
+            if s_match and l_match and r_match:
+                step = int(s_match.group(1))
+                loss_val = float(l_match.group(1))
+                reward_val = float(r_match.group(1))
+
+                with _STATE_LOCK:
+                    _METRICS["steps"].append(step)
+                    _METRICS["loss"].append(loss_val)
+                    _METRICS["reward"].append(reward_val)
+
+                    if len(_METRICS["steps"]) > 200:
+                        _METRICS["steps"].pop(0)
+                        _METRICS["loss"].pop(0)
+                        _METRICS["reward"].pop(0)
+
+        proc.wait()
+
+    except Exception as exc:
+        with _STATE_LOCK:
+            _STATUS = "error"
+            _ERROR = str(exc)
+            _LOGS.append(f"[{time.strftime('%X')}] veRL Error: {exc}")
+            _TRAINING_ACTIVE = False
+    finally:
+        with _STATE_LOCK:
+            if _STATUS != "error":
+                _STATUS = "idle"
+                _LOGS.append(f"[{time.strftime('%X')}] veRL Training loop stopped.")
+
+
+def _run_custom(model_name: str, lr: float, batch_size: int, group_size: int) -> None:
+    global _TRAINING_ACTIVE, _STATUS, _ERROR, _TRAINER_ACTOR, _METRICS, _LOGS
+    import ray
+    from tasks import RLTrainer
+
+    with _STATE_LOCK:
+        _STATUS = "starting"
+        _ERROR = None
+        _LOGS.append(f"[{time.strftime('%X')}] Connecting to Ray Cluster at {RAY_ADDRESS}...")
+
+    try:
+        _ensure_ray()
+        with _STATE_LOCK:
+            _LOGS.append(f"[{time.strftime('%X')}] Allocating GPU and initializing RLTrainer Actor...")
+
+        # Instantiate RLTrainer as a remote Ray Actor on a GPU worker node.
+        # This blocks until Ray schedules the actor (which triggers worker scale-up!)
+        # and loads the model into GPU memory.
+        _TRAINER_ACTOR = RLTrainer.options(num_gpus=1).remote(model_name=model_name, lr=lr)
+
+        # Call a quick ping to verify liveness
+        ray.get(_TRAINER_ACTOR.reward_fn.remote("42", "42"))
+
+        with _STATE_LOCK:
+            _STATUS = "training"
+            _LOGS.append(f"[{time.strftime('%X')}] Model '{model_name}' loaded successfully on GPU!")
+            _LOGS.append(f"[{time.strftime('%X')}] Starting GRPO alignment loop on GSM8K math dataset...")
+
+        while True:
+            with _STATE_LOCK:
+                if not _TRAINING_ACTIVE:
+                    break
+
+            start_time = time.time()
+            step_ref = _TRAINER_ACTOR.train_step.remote(batch_size=batch_size, group_size=group_size)
+            result = ray.get(step_ref)
+            elapsed = time.time() - start_time
+
+            with _STATE_LOCK:
+                step = result["step"]
+                loss = result["loss"]
+                reward = result["avg_reward"]
+                pod = result["pod_name"]
+
+                _METRICS["steps"].append(step)
+                _METRICS["loss"].append(loss)
+                _METRICS["reward"].append(reward)
+
+                if len(_METRICS["steps"]) > 200:
+                    _METRICS["steps"].pop(0)
+                    _METRICS["loss"].pop(0)
+                    _METRICS["reward"].pop(0)
+
+                log_line = f"[{time.strftime('%X')}] Step {step} | Loss: {loss:.4f} | Avg Acc: {reward:.2%} | Time: {elapsed:.1f}s | Worker: {pod}"
+                _LOGS.append(log_line)
+
+                # Append detailed completions
+                for item in result["logs"]:
+                    _LOGS.append(f"  Question: {item['question']}")
+                    _LOGS.append(f"  Target: {item['target'].strip()}")
+                    for idx, compl in enumerate(item["completions"]):
+                        clean_text = compl["text"].replace("\n", " ").strip()[:120]
+                        _LOGS.append(f"    Rollout {idx+1}: Reward {compl['reward']:.1f} | Adv {compl['advantage']:.2f} | Ans: {clean_text}...")
+                
+                if len(_LOGS) > 300:
+                    _LOGS = _LOGS[-300:]
+
+            time.sleep(0.5)
+
+    except Exception as exc:
+        with _STATE_LOCK:
+            _STATUS = "error"
+            _ERROR = str(exc)
+            _LOGS.append(f"[{time.strftime('%X')}] ERROR: {exc}")
+            _TRAINING_ACTIVE = False
+    finally:
+        with _STATE_LOCK:
+            if _STATUS != "error":
+                _STATUS = "idle"
+                _LOGS.append(f"[{time.strftime('%X')}] Training loop stopped.")
+            _TRAINER_ACTOR = None
+
+
+def _run_training(model_name: str, framework: str, lr: float, batch_size: int, group_size: int) -> None:
+    if framework == "verl":
+        _run_verl(model_name, lr, batch_size, group_size)
+    else:
+        _run_custom(model_name, lr, batch_size, group_size)
 
 
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
-class RenderRequest(BaseModel):
-    preset: str = Field(default="overview")
-    # Optional explicit window; overrides preset when all three are provided.
-    center_x: float | None = None
-    center_y: float | None = None
-    zoom: float | None = None
-    resolution: int = Field(default=1024, ge=128, le=4096)
-    max_iter: int = Field(default=256, ge=32, le=2000)
-    # Informational: the live cap is the RayCluster autoscaler maxReplicas.
-    max_workers: int | None = None
-
-
-# --------------------------------------------------------------------------- #
-# Render driver
-# --------------------------------------------------------------------------- #
-def _run_render(job_id: str, req: RenderRequest) -> None:
-    """Background driver: launch tile tasks, collect with ray.wait, enqueue."""
-    import ray
-
-    q: queue.Queue = _JOBS[job_id]["queue"]
-    try:
-        if req.center_x is not None and req.center_y is not None and req.zoom is not None:
-            cx, cy, zoom = req.center_x, req.center_y, req.zoom
-        else:
-            cx, cy, zoom = PRESETS.get(req.preset, PRESETS["overview"])
-
-        specs = build_tile_specs(
-            width=req.resolution,
-            height=req.resolution,
-            tile=TILE_PX,
-            center_x=cx,
-            center_y=cy,
-            zoom=zoom,
-            max_iter=req.max_iter,
-        )
-        _JOBS[job_id]["tiles"] = len(specs)
-        q.put({"type": "meta", "tiles": len(specs), "tile_px": TILE_PX,
-               "width": req.resolution, "height": req.resolution})
-
-        refs = [render_tile.remote(s) for s in specs]
-        pending = list(refs)
-        while pending:
-            ready, pending = ray.wait(pending, num_returns=1, timeout=30.0)
-            for ref in ready:
-                tile = ray.get(ref)
-                tile["type"] = "tile"
-                q.put(tile)
-        q.put({"type": "done", "elapsed_ms": int((time.time() - _JOBS[job_id]["started"]) * 1000)})
-    except Exception as exc:  # surface failures, don't swallow them
-        _mark_ray_down()  # force a reconnect on the next render
-        q.put({"type": "error", "message": str(exc)})
-    finally:
-        q.put(None)  # sentinel
+class TrainRequest(BaseModel):
+    model_name: str = Field(default=DEFAULT_MODEL)
+    framework: str = Field(default="custom")
+    lr: float = Field(default=5e-5, ge=1e-6, le=1e-3)
+    batch_size: int = Field(default=2, ge=1, le=8)
+    group_size: int = Field(default=4, ge=2, le=8)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,86 +342,61 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/presets")
-def presets() -> dict:
-    return {
-        name: {"center_x": c[0], "center_y": c[1], "zoom": c[2]}
-        for name, c in PRESETS.items()
-    }
+@app.post("/start")
+def start_training(req: TrainRequest) -> dict:
+    global _TRAINING_ACTIVE, _TRAINING_THREAD
+    with _STATE_LOCK:
+        if _TRAINING_ACTIVE or _STATUS == "starting":
+            return {"status": "already_running"}
+        
+        _TRAINING_ACTIVE = True
+        _METRICS["steps"].clear()
+        _METRICS["loss"].clear()
+        _METRICS["reward"].clear()
+        _LOGS.clear()
+
+        _TRAINING_THREAD = threading.Thread(
+            target=_run_training,
+            args=(req.model_name, req.framework, req.lr, req.batch_size, req.group_size),
+            daemon=True
+        )
+        _TRAINING_THREAD.start()
+        return {"status": "started"}
 
 
-@app.post("/render")
-def render(req: RenderRequest) -> dict:
-    """Kick off a distributed render; returns a job id to stream."""
-    try:
-        _ensure_ray()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Ray not reachable: {exc}")
-
-    job_id = uuid.uuid4().hex[:12]
-    _JOBS[job_id] = {"queue": queue.Queue(), "tiles": 0, "started": time.time()}
-    threading.Thread(target=_run_render, args=(job_id, req), daemon=True).start()
-    return {"job_id": job_id}
+@app.post("/stop")
+def stop_training() -> dict:
+    global _TRAINING_ACTIVE
+    with _STATE_LOCK:
+        if not _TRAINING_ACTIVE:
+            return {"status": "not_running"}
+        _TRAINING_ACTIVE = False
+        _LOGS.append(f"[{time.strftime('%X')}] Stopping training loop...")
+        return {"status": "stopping"}
 
 
-@app.get("/render/{job_id}/stream")
-def stream(job_id: str) -> StreamingResponse:
-    """SSE stream of completed tiles for a render job."""
-    job = _JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="unknown job")
-
-    def gen():
-        q: queue.Queue = job["queue"]
-        while True:
-            try:
-                item = q.get(timeout=0.5)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if item is None:
-                break
-            yield f"data: {json.dumps(item)}\n\n"
-        _JOBS.pop(job_id, None)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+@app.get("/status")
+def get_status() -> dict:
+    with _STATE_LOCK:
+        return {
+            "status": _STATUS,
+            "active": _TRAINING_ACTIVE,
+            "error": _ERROR,
+            "total_steps": len(_METRICS["steps"])
+        }
 
 
-@app.get("/dashboard")
-def dashboard() -> dict:
-    """External URL of the Ray Dashboard LoadBalancer (null until it gets an IP)."""
-    try:
-        from kubernetes import client, config
-
-        try:
-            config.load_incluster_config()
-        except Exception:
-            config.load_kube_config()
-        v1 = client.CoreV1Api()
-        svc = v1.read_namespaced_service("ray-dashboard", POD_NAMESPACE)
-        ingress = (svc.status.load_balancer.ingress or []) if svc.status.load_balancer else []
-        ip = ingress[0].ip if ingress else None
-        return {"url": f"http://{ip}/" if ip else None}
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"cannot read dashboard service: {exc}")
+@app.get("/metrics")
+def get_metrics() -> dict:
+    with _STATE_LOCK:
+        return _METRICS
 
 
-@app.get("/metrics-link")
-def metrics_link() -> dict:
-    """URL of the Cloud Monitoring dashboard (set by deploy into the ray-links
-    ConfigMap). Null if metrics/GMP weren't wired up."""
-    try:
-        from kubernetes import client, config
-
-        try:
-            config.load_incluster_config()
-        except Exception:
-            config.load_kube_config()
-        v1 = client.CoreV1Api()
-        cm = v1.read_namespaced_config_map("ray-links", POD_NAMESPACE)
-        return {"url": (cm.data or {}).get("metrics_url")}
-    except Exception:
-        return {"url": None}
+@app.get("/logs/stream")
+def stream_logs() -> dict:
+    """Returns recent log lines."""
+    with _STATE_LOCK:
+        return {"logs": _LOGS}
 
 
 @app.get("/workers")
@@ -302,6 +425,20 @@ def workers() -> dict:
         raise HTTPException(status_code=503, detail=f"cannot list pods: {exc}")
 
 
-# Connect to Ray in the background so the first render doesn't pay the cold
-# ray.init() cost, and so a dropped connection is re-established proactively.
-threading.Thread(target=_prewarm_ray, daemon=True).start()
+@app.get("/dashboard")
+def dashboard() -> dict:
+    """External URL of the Ray Dashboard LoadBalancer."""
+    try:
+        from kubernetes import client, config
+
+        try:
+            config.load_incluster_config()
+        except Exception:
+            config.load_kube_config()
+        v1 = client.CoreV1Api()
+        svc = v1.read_namespaced_service("ray-dashboard", POD_NAMESPACE)
+        ingress = (svc.status.load_balancer.ingress or []) if svc.status.load_balancer else []
+        ip = ingress[0].ip if ingress else None
+        return {"url": f"http://{ip}/" if ip else None}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"cannot read dashboard service: {exc}")

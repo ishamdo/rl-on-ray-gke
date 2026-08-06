@@ -3,16 +3,48 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ray Render Farm — KubeRay on GKE</title>
+  <title>RL on Ray — Qwen & GSM8K on GKE</title>
   <link rel="stylesheet" href="/static/features/ray/style.css" />
+  <style>
+    /* Custom additions for the RL Console */
+    .console-wrap {
+      margin-top: 15px;
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .console-wrap h3 {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: #999;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    #console-log {
+      margin: 0;
+      height: 240px;
+      overflow-y: auto;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #ddd;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .badge-error {
+      background: #f43f5e;
+      color: #fff;
+    }
+  </style>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="logo">🌀</span>
       <div>
-        <h1>Ray Render Farm</h1>
-        <p class="subtitle">Distributed Mandelbrot rendering on KubeRay · GKE</p>
+        <h1>RL on Ray</h1>
+        <p class="subtitle">Distributed GRPO alignment loop using Qwen & GSM8K on GKE</p>
       </div>
     </div>
     <div class="topbar-right">
@@ -29,69 +61,77 @@
   <main class="layout">
     <!-- Controls --------------------------------------------------------- -->
     <section class="panel controls">
-      <h2>Render</h2>
+      <h2>RL Trainer</h2>
 
-      <label>Region
-        <select id="preset"></select>
-      </label>
-
-      <label>Resolution
-        <select id="resolution">
-          <option value="256">256 × 256 · 4 tiles</option>
-          <option value="512">512 × 512 · 16 tiles</option>
-          <option value="1024">1024 × 1024 · 64 tiles</option>
-          <option value="2048" selected>2048 × 2048 · 256 tiles</option>
-          <option value="4096">4096 × 4096 · 1024 tiles</option>
+      <label>Model Name
+        <select id="model_name">
+          <option value="Qwen/Qwen2.5-1.5B-Instruct" selected>Qwen 2.5 - 1.5B Instruct (LoRA)</option>
+          <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen 2.5 - 0.5B Instruct (LoRA)</option>
         </select>
-        <small class="field-note">More tiles = more Ray tasks = more workers.</small>
       </label>
 
-      <label>Detail (max iterations)
-        <input id="max_iter" type="range" min="64" max="1000" step="32" value="256" />
-        <output id="max_iter_out">256</output>
+      <label>Training Framework
+        <select id="framework">
+          <option value="custom" selected>Custom GRPO (PyTorch)</option>
+          <option value="verl">veRL (HybridFlow/Ray)</option>
+        </select>
+      </label>
+
+      <label>Batch Size (prompts)
+        <select id="batch_size">
+          <option value="1">1 prompt</option>
+          <option value="2" selected>2 prompts (Recommended)</option>
+          <option value="4">4 prompts</option>
+        </select>
+        <small class="field-note">Number of math problems evaluated in parallel.</small>
+      </label>
+
+      <label>Group Size (rollouts per prompt)
+        <input id="group_size" type="range" min="2" max="16" step="1" value="8" />
+        <output id="group_size_out">8</output>
         <small class="field-note">
-          Iterations of <code>z = z² + c</code> per pixel before a point counts as
-          "inside" the set. Higher = sharper boundary detail and more CPU per tile;
-          lower = faster but blockier.
+          Number of completions generated per question to calculate relative rewards and advantages.
         </small>
       </label>
 
-      <button id="launch" class="btn btn-primary">Launch render</button>
+      <button id="launch" class="btn btn-primary">Start Training</button>
 
-      <details class="how">
+      <details class="how" open>
         <summary>How it works</summary>
         <ol>
-          <li>The controller (a <b>Ray driver</b>) splits the image into 128×128
-            tiles and submits <b>one Ray task per tile</b> to the cluster.</li>
-          <li>Ray spreads the tasks across <b>worker pods</b>. Too few workers →
-            tasks queue → <b>KubeRay autoscales</b>, asking GKE to add worker pods
-            on <b>Spot VMs</b> (created on demand).</li>
-          <li>Each finished tile streams back over <b>SSE</b> and is painted here,
-            tagged with the <b>pod</b> that computed it (see the cluster map).</li>
-          <li>After ~1 min idle, workers <b>scale back to zero</b>.</li>
+          <li>Clicking <b>Start Training</b> connects the driver to the Ray head and instantiates a remote <b>RLTrainer Ray Actor</b> on a GPU worker.</li>
+          <li>Ray's autoscaler detects the <code>num_gpus=1</code> resource requirement and triggers KubeRay to scale up a <b>Spot GPU node</b> (via <code>ray-gpu</code>).</li>
+          <li>The Actor loads the <b>Qwen model</b> with <b>LoRA adapters</b> and evaluates GSM8K math questions.</li>
+          <li>For each question, it samples multiple answers, scores them rule-based (correct/incorrect), calculates relative advantages (GRPO), and optimizes model policy.</li>
+          <li>Loss and Accuracy (Avg Reward) charts update live. When stopped, the idle GPU node is automatically reclaimed.</li>
         </ol>
       </details>
     </section>
 
-    <!-- Canvas ----------------------------------------------------------- -->
+    <!-- Canvas & Logs ----------------------------------------------------- -->
     <section class="panel canvas-wrap">
-      <h2>Output <span id="progress" class="muted"></span></h2>
+      <h2>Training Metrics <span id="progress" class="muted"></span></h2>
       <div class="canvas-frame">
-        <canvas id="canvas" width="1024" height="1024"></canvas>
+        <canvas id="canvas" width="1024" height="600"></style>
+      </div>
+      
+      <div class="console-wrap">
+        <h3>Real-time Rollouts & Optimizer Logs</h3>
+        <pre id="console-log">Console idle. Click "Start Training" to begin.</pre>
       </div>
     </section>
 
     <!-- Cluster map + stats ---------------------------------------------- -->
     <section class="panel cluster">
-      <h2>Cluster <span id="worker-count" class="muted"></span></h2>
+      <h2>Ray Cluster Nodes <span id="worker-count" class="muted"></span></h2>
       <div id="pods" class="pods"></div>
 
       <h3>Stats</h3>
       <ul class="stats">
-        <li><span>Tiles</span><b id="stat-tiles">0 / 0</b></li>
+        <li><span>Steps</span><b id="stat-tiles">0</b></li>
         <li><span>Active pods</span><b id="stat-pods">0</b></li>
-        <li><span>Throughput</span><b id="stat-tput">0 /s</b></li>
-        <li><span>Elapsed</span><b id="stat-elapsed">0.0 s</b></li>
+        <li><span>Step Time</span><b id="stat-tput">0.0s</b></li>
+        <li><span>Elapsed</span><b id="stat-elapsed">0s</b></li>
       </ul>
     </section>
   </main>

@@ -1,0 +1,82 @@
+[
+  {
+    "question": "Weng earns $12 an hour for babysitting. Yesterday, she babysat for 5 hours. How much money did she earn?",
+    "answer": "Weng earns $12 an hour. She babysat for 5 hours. So she earned 12 * 5 = $60.\n#### 60"
+  },
+  {
+    "question": "Albert is 4 years older than his sister. His sister is 12 years old. How old is Albert?",
+    "answer": "His sister is 12 years old. Albert is 4 years older, so Albert is 12 + 4 = 16 years old.\n#### 16"
+  },
+  {
+    "question": "Aika has 10 apples. She gives 3 to her brother and 2 to her sister. How many apples does she have left?",
+    "answer": "She gives away 3 + 2 = 5 apples. She started with 10 apples, so she has 10 - 5 = 5 apples left.\n#### 5"
+  },
+  {
+    "question": "If John has 5 boxes of chocolates, and each box has 10 chocolates, how many chocolates does John have in total?",
+    "answer": "John has 5 boxes. Each box has 10 chocolates. Total = 5 * 10 = 50 chocolates.\n#### 50"
+  },
+  {
+    "question": "Mary has 30 books. She wants to divide them equally among 3 shelves. How many books will be on each shelf?",
+    "answer": "Mary has 30 books. Dividing equally among 3 shelves: 30 / 3 = 10 books per shelf.\n#### 10"
+  },
+  {
+    "question": "A pen costs $3 and a notebook costs $5. How much do 2 pens and 3 notebooks cost in total?",
+    "answer": "2 pens cost 2 * $3 = $6. 3 notebooks cost 3 * $5 = $15. Total = $6 + $15 = $21.\n#### 21"
+  },
+  {
+    "question": "A car travels at a speed of 60 miles per hour. How many miles will it travel in 3 hours?",
+    "answer": "Distance = speed * time = 60 * 3 = 180 miles.\n#### 180"
+  },
+  {
+    "question": "A rectangle has a length of 8 cm and a width of 5 cm. What is the area of the rectangle in square centimeters?",
+    "answer": "Area = length * width = 8 * 5 = 40 square cm.\n#### 40"
+  },
+  {
+    "question": "Sarah has $50. She buys a shirt for $22 and a hat for $15. How much money does she have left?",
+    "answer": "Total spent = $22 + $15 = $37. Money left = $50 - $37 = $13.\n#### 13"
+  },
+  {
+    "question": "A baker made 40 cookies. He sold 25 of them and ate 3. How many cookies are left?",
+    "answer": "Cookies removed = 25 sold + 3 eaten = 28 cookies. Cookies left = 40 - 28 = 12 cookies.\n#### 12"
+  },
+  {
+    "question": "Tom has 3 times as many marbles as Jerry. Jerry has 8 marbles. How many marbles does Tom have?",
+    "answer": "Tom has 3 * Jerry's marbles = 3 * 8 = 24 marbles.\n#### 24"
+  },
+  {
+    "question": "A school has 4 classes. Each class has 25 students. How many students are there in the school?",
+    "answer": "Total students = 4 classes * 25 students = 100 students.\n#### 100"
+  },
+  {
+    "question": "A farmer has 15 chickens and 10 cows. How many legs do all the animals have in total?",
+    "answer": "Chickens have 2 legs: 15 * 2 = 30 legs. Cows have 4 legs: 10 * 4 = 40 legs. Total legs = 30 + 40 = 70 legs.\n#### 70"
+  },
+  {
+    "question": "If a toy costs $15 and is on sale for 20% off, what is the sale price of the toy?",
+    "answer": "Discount = 20% of $15 = 0.2 * 15 = $3. Sale price = $15 - $3 = $12.\n#### 12"
+  },
+  {
+    "question": "A movie is 2 hours long. How many minutes long is the movie?",
+    "answer": "1 hour = 60 minutes. 2 hours = 2 * 60 = 120 minutes.\n#### 120"
+  },
+  {
+    "question": "A library has 120 history books and 80 science books. How many books are there in total?",
+    "answer": "Total books = 120 + 80 = 200 books.\n#### 200"
+  },
+  {
+    "question": "A train leaves at 9:00 AM and arrives at its destination at 1:00 PM. How many hours did the journey take?",
+    "answer": "From 9:00 AM to 12:00 PM is 3 hours. From 12:00 PM to 1:00 PM is 1 hour. Total = 3 + 1 = 4 hours.\n#### 4"
+  },
+  {
+    "question": "If a box contains 6 red balls and 4 blue balls, what is the total number of balls in the box?",
+    "answer": "Total balls = 6 red + 4 blue = 10 balls.\n#### 10"
+  },
+  {
+    "question": "A factory produces 500 items per day. How many items does it produce in a 5-day work week?",
+    "answer": "Total production = 500 * 5 = 2500 items.\n#### 2500"
+  },
+  {
+    "question": "A pizza is cut into 8 slices. If David eats 3 slices, what fraction of the pizza is left?",
+    "answer": "Slices left = 8 - 3 = 5 slices. Fraction left = 5/8.\n#### 5/8"
+  }
+]

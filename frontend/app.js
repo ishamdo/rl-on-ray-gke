@@ -1,13 +1,7 @@
-/* Ray Render Farm — playroom frontend.
+/* RL on Ray — Playroom Frontend.
  *
- * Two call surfaces:
- *   - control plane: `/api/features/ray/...` (Hub, JWT). Used for /config,
- *     /presets, and ALL calls when MODE=MOCK.
- *   - data plane: the Gateway IP directly (CORS, no auth). Used for /render,
- *     the SSE tile stream, and /workers when running LIVE.
- *
- * SSE is consumed via fetch+ReadableStream (not EventSource) so we can attach
- * the admin JWT in MOCK mode — EventSource cannot set headers.
+ * Controls the RL Training loop by calling FastAPI endpoints (/start, /stop, /status, /metrics, /logs/stream)
+ * and visualizes the convergence (Accuracy & Loss charts) and active Ray pods.
  */
 
 const HUB_BASE = "/api/features/ray";
@@ -16,25 +10,32 @@ const els = {
   mode: document.getElementById("mode-badge"),
   dash: document.getElementById("dashboard-btn"),
   metrics: document.getElementById("metrics-btn"),
-  preset: document.getElementById("preset"),
-  resolution: document.getElementById("resolution"),
-  maxIter: document.getElementById("max_iter"),
-  maxIterOut: document.getElementById("max_iter_out"),
+  modelName: document.getElementById("model_name"),
+  framework: document.getElementById("framework"),
+  batchSize: document.getElementById("batch_size"),
+  groupSize: document.getElementById("group_size"),
+  groupSizeOut: document.getElementById("group_size_out"),
   launch: document.getElementById("launch"),
   progress: document.getElementById("progress"),
   canvas: document.getElementById("canvas"),
   pods: document.getElementById("pods"),
   workerCount: document.getElementById("worker-count"),
-  statTiles: document.getElementById("stat-tiles"),
+  statSteps: document.getElementById("stat-tiles"),
   statPods: document.getElementById("stat-pods"),
-  statTput: document.getElementById("stat-tput"),
+  statTime: document.getElementById("stat-tput"),
   statElapsed: document.getElementById("stat-elapsed"),
+  consoleLog: document.getElementById("console-log"),
 };
 
 const ctx = els.canvas.getContext("2d");
 let cfg = { mode: "MOCK", dataBase: HUB_BASE, dashboard_url: null };
-let pods = new Map(); // pod_name -> {type, status, count, el}
+let pods = new Map(); // name -> {type, status, count, el}
+let pollInterval = null;
 let workersTimer = null;
+
+let metricsHistory = { steps: [], loss: [], reward: [] };
+let trainingActive = false;
+let startTime = null;
 
 /* ---- auth + bases ----------------------------------------------------- */
 function jwt() {
@@ -46,15 +47,12 @@ function hubHeaders() {
   if (t) h["Authorization"] = `Bearer ${t}`;
   return h;
 }
-// In MOCK everything flows through the Hub (JWT). In LIVE the data plane hits
-// the Gateway IP with CORS and no auth.
 function dataHeaders() {
   return cfg.mode === "MOCK" ? hubHeaders() : { "Content-Type": "application/json" };
 }
 
 /* ---- config / bootstrap ---------------------------------------------- */
 async function loadConfig() {
-  // Allow a standalone override: ?api=http://IP points the data plane directly.
   const override = new URLSearchParams(location.search).get("api");
   try {
     const r = await fetch(`${HUB_BASE}/config`, { headers: hubHeaders() });
@@ -71,29 +69,8 @@ async function loadConfig() {
   } catch (_) {
     /* fall through to standalone */
   }
-  // Standalone: no Hub. Talk to the controller directly.
   cfg.mode = "LIVE";
   cfg.dataBase = override || location.origin;
-}
-
-async function loadPresets() {
-  const url = cfg.mode === "MOCK" ? `${HUB_BASE}/presets` : `${cfg.dataBase}/presets`;
-  try {
-    const r = await fetch(url, { headers: dataHeaders() });
-    const data = await r.json();
-    els.preset.innerHTML = "";
-    Object.keys(data).forEach((name) => {
-      const o = document.createElement("option");
-      o.value = name;
-      o.textContent = name;
-      els.preset.appendChild(o);
-    });
-  } catch (_) {
-    ["overview", "seahorse", "spiral", "elephant", "minibrot"].forEach((n) => {
-      const o = document.createElement("option");
-      o.value = n; o.textContent = n; els.preset.appendChild(o);
-    });
-  }
 }
 
 function applyConfigUI() {
@@ -101,8 +78,6 @@ function applyConfigUI() {
   els.mode.className = "badge " + (cfg.mode === "MOCK" ? "badge-mock" : "badge-live");
 }
 
-// The Ray Dashboard has its own LoadBalancer; its IP is reported by the
-// controller's /dashboard endpoint (it may be null until the LB gets an IP).
 async function refreshDashboard() {
   if (cfg.mode === "MOCK" || !els.dash.hidden) return;
   try {
@@ -118,7 +93,6 @@ async function refreshDashboard() {
   }
 }
 
-// Cloud Monitoring dashboard link (set by deploy into the ray-links ConfigMap).
 async function refreshMetrics() {
   if (cfg.mode === "MOCK" || !els.metrics.hidden) return;
   try {
@@ -175,7 +149,6 @@ async function pollWorkers() {
       const type = pod.node_type === "head" ? "head" : "worker";
       ensurePod(pod.pod_name, type, pod.status);
     });
-    // Drop pods that the autoscaler has removed (and that aren't mid-render).
     for (const [name, p] of pods) {
       if (!seen.has(name) && p.count === 0) {
         p.el.remove();
@@ -190,112 +163,257 @@ async function pollWorkers() {
   }
 }
 
-/* ---- render ----------------------------------------------------------- */
-function resetCanvas(size) {
-  els.canvas.width = size;
-  els.canvas.height = size;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, size, size);
+/* ---- chart drawing --------------------------------------------------- */
+function resetCanvas() {
+  const w = els.canvas.width;
+  const h = els.canvas.height;
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, w, h);
+  
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  ctx.fillStyle = "#888";
+  ctx.font = "14px monospace";
+  ctx.fillText("Model training charts empty. Start training to view graphs.", 40, h / 2 - 10);
 }
 
-function drawTile(t) {
-  const img = new Image();
-  img.onload = () => ctx.drawImage(img, t.x, t.y, t.w, t.h);
-  img.src = "data:image/png;base64," + t.png_base64;
-}
-
-async function streamSSE(url, headers, onMsg) {
-  const r = await fetch(url, { headers });
-  if (!r.ok || !r.body) throw new Error(`stream failed: ${r.status}`);
-  const reader = r.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf("\n\n")) >= 0) {
-      const chunk = buf.slice(0, i);
-      buf = buf.slice(i + 2);
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (line) onMsg(JSON.parse(line.slice(5).trim()));
-    }
+function drawCharts() {
+  const w = els.canvas.width;
+  const h = els.canvas.height;
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, w, h);
+  
+  // Grid lines
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  // horizontal split
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  // vertical grids
+  for (let x = 100; x < w; x += 100) {
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
   }
+  ctx.stroke();
+  
+  const len = metricsHistory.steps.length;
+  if (len < 2) {
+    ctx.fillStyle = "#fff";
+    ctx.font = "14px monospace";
+    ctx.fillText("Waiting for training steps (loading model/scaling GPU)...", 30, h / 2 - 10);
+    return;
+  }
+  
+  // Draw Accuracy (Reward) - Top half (scales 0.0 to 1.0)
+  ctx.strokeStyle = "#10b981"; // emerald green
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let i = 0; i < len; i++) {
+    const x = (i / (len - 1)) * w;
+    const val = metricsHistory.reward[i];
+    const y = (h / 2) - 15 - val * (h / 2 - 35);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  
+  // Draw Loss - Bottom half
+  ctx.strokeStyle = "#f43f5e"; // rose/red
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  const maxLoss = Math.max(...metricsHistory.loss, 0.5);
+  for (let i = 0; i < len; i++) {
+    const x = (i / (len - 1)) * w;
+    const val = metricsHistory.loss[i];
+    const y = h - 15 - (val / maxLoss) * (h / 2 - 35);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  
+  // Labels
+  ctx.fillStyle = "#10b981";
+  ctx.font = "bold 13px monospace";
+  ctx.fillText(`Accuracy (Avg Reward): ${(metricsHistory.reward[len-1] * 100).toFixed(0)}%`, 15, 25);
+  
+  ctx.fillStyle = "#f43f5e";
+  ctx.font = "bold 13px monospace";
+  ctx.fillText(`Loss: ${metricsHistory.loss[len-1].toFixed(4)}`, 15, h / 2 + 25);
+
+  ctx.fillStyle = "#888";
+  ctx.font = "11px monospace";
+  ctx.fillText(`Step ${metricsHistory.steps[len-1]}`, w - 70, h / 2 - 10);
 }
 
-async function runRender() {
+/* ---- training loop control ------------------------------------------- */
+async function startTraining() {
   els.launch.disabled = true;
-  // Reset render state (keep discovered pods; zero their counts).
-  for (const p of pods.values()) {
-    p.count = 0;
-    p.el.querySelector(".pcount").textContent = "0";
-  }
-
-  const size = parseInt(els.resolution.value, 10);
-  resetCanvas(size);
+  els.consoleLog.textContent = "Requesting training start...\n";
 
   const body = JSON.stringify({
-    preset: els.preset.value,
-    resolution: size,
-    max_iter: parseInt(els.maxIter.value, 10),
+    model_name: els.modelName.value,
+    framework: els.framework.value,
+    batch_size: parseInt(els.batchSize.value, 10),
+    group_size: parseInt(els.groupSize.value, 10),
   });
 
-  let total = 0;
-  let done = 0;
-  const t0 = performance.now();
-  const tick = setInterval(() => {
-    els.statElapsed.textContent = ((performance.now() - t0) / 1000).toFixed(1) + " s";
-    const secs = (performance.now() - t0) / 1000;
-    els.statTput.textContent = (secs > 0 ? (done / secs).toFixed(1) : "0") + " /s";
-  }, 100);
-
   try {
-    const renderUrl = cfg.mode === "MOCK" ? `${HUB_BASE}/render` : `${cfg.dataBase}/render`;
-    const r = await fetch(renderUrl, { method: "POST", headers: dataHeaders(), body });
-    if (!r.ok) throw new Error(`render failed: ${r.status}`);
-    const { job_id } = await r.json();
+    const url = cfg.mode === "MOCK" ? `${HUB_BASE}/start` : `${cfg.dataBase}/start`;
+    const r = await fetch(url, { method: "POST", headers: dataHeaders(), body });
+    if (!r.ok) throw new Error(`start failed: ${r.status}`);
+    const data = await r.json();
 
-    const streamUrl =
-      cfg.mode === "MOCK"
-        ? `${HUB_BASE}/render/${job_id}/stream`
-        : `${cfg.dataBase}/render/${job_id}/stream`;
-
-    await streamSSE(streamUrl, dataHeaders(), (m) => {
-      if (m.type === "meta") {
-        total = m.tiles;
-        els.statTiles.textContent = `0 / ${total}`;
-        els.progress.textContent = `· rendering ${total} tiles`;
-      } else if (m.type === "tile") {
-        done += 1;
-        drawTile(m);
-        bumpPod(m.pod_name);
-        els.statTiles.textContent = `${done} / ${total}`;
-      } else if (m.type === "done") {
-        els.progress.textContent = `· done in ${(m.elapsed_ms / 1000).toFixed(1)}s`;
-      } else if (m.type === "error") {
-        els.progress.textContent = `· error: ${m.message}`;
-      }
-    });
+    if (data.status === "started" || data.status === "already_running") {
+      trainingActive = true;
+      startTime = Date.now();
+      els.launch.textContent = "Stop Training";
+      els.launch.className = "btn btn-danger"; // change style to red
+      els.launch.disabled = false;
+      
+      // Start polling status & logs
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(pollTrainingState, 1000);
+    }
   } catch (e) {
-    els.progress.textContent = `· ${e.message}`;
-  } finally {
-    clearInterval(tick);
+    els.consoleLog.textContent += `Failed to start training: ${e.message}\n`;
     els.launch.disabled = false;
   }
 }
 
-/* ---- init ------------------------------------------------------------- */
-els.maxIter.addEventListener("input", () => (els.maxIterOut.textContent = els.maxIter.value));
-els.launch.addEventListener("click", runRender);
+async function stopTraining() {
+  els.launch.disabled = true;
+  els.consoleLog.textContent += "\nStopping training loop...\n";
 
+  try {
+    const url = cfg.mode === "MOCK" ? `${HUB_BASE}/stop` : `${cfg.dataBase}/stop`;
+    const r = await fetch(url, { method: "POST", headers: dataHeaders() });
+    if (!r.ok) throw new Error(`stop failed: ${r.status}`);
+  } catch (e) {
+    els.consoleLog.textContent += `Stop request error: ${e.message}\n`;
+    els.launch.disabled = false;
+  }
+}
+
+async function pollTrainingState() {
+  try {
+    const statusUrl = cfg.mode === "MOCK" ? `${HUB_BASE}/status` : `${cfg.dataBase}/status`;
+    const r = await fetch(statusUrl, { headers: dataHeaders() });
+    if (!r.ok) return;
+    const s = await r.json();
+
+    // Update status text
+    if (s.status === "starting") {
+      els.progress.textContent = "· starting (scaling node & loading model)...";
+    } else if (s.status === "training") {
+      els.progress.textContent = "· active training";
+    } else if (s.status === "error") {
+      els.progress.textContent = `· error: ${s.error}`;
+      stopPoll();
+    } else if (s.status === "idle") {
+      els.progress.textContent = "· idle";
+      stopPoll();
+    }
+
+    // Refresh logs & metrics
+    await fetchLogs();
+    await fetchMetrics();
+    
+    // Update elapsed time
+    if (startTime) {
+      const diffSecs = Math.floor((Date.now() - startTime) / 1000);
+      els.statElapsed.textContent = `${diffSecs}s`;
+    }
+  } catch (_) {
+    /* ignore transient */
+  }
+}
+
+function stopPoll() {
+  trainingActive = false;
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  els.launch.textContent = "Start Training";
+  els.launch.className = "btn btn-primary";
+  els.launch.disabled = false;
+}
+
+async function fetchLogs() {
+  try {
+    const url = cfg.mode === "MOCK" ? `${HUB_BASE}/logs/stream` : `${cfg.dataBase}/logs/stream`;
+    const r = await fetch(url, { headers: dataHeaders() });
+    if (!r.ok) return;
+    const { logs } = await r.json();
+    if (logs && logs.length > 0) {
+      // Find the last line that names a pod, and trigger pod animation in cluster map
+      const lastLine = logs[logs.length - 1];
+      const match = lastLine.match(/Worker:\s*([^\s|]+)/);
+      if (match) {
+        bumpPod(match[1].trim());
+      }
+      
+      els.consoleLog.textContent = logs.join("\n");
+      els.consoleLog.scrollTop = els.consoleLog.scrollHeight;
+    }
+  } catch (_) {}
+}
+
+async function fetchMetrics() {
+  try {
+    const url = cfg.mode === "MOCK" ? `${HUB_BASE}/metrics` : `${cfg.dataBase}/metrics`;
+    const r = await fetch(url, { headers: dataHeaders() });
+    if (!r.ok) return;
+    const m = await r.json();
+    metricsHistory = m;
+    
+    drawCharts();
+    
+    if (m.steps.length > 0) {
+      els.statSteps.textContent = m.steps[m.steps.length - 1];
+      
+      // Calculate step time
+      const diffSecs = (Date.now() - startTime) / 1000;
+      const stepCount = m.steps[m.steps.length - 1];
+      els.statTime.textContent = `${(diffSecs / stepCount).toFixed(1)}s`;
+    }
+  } catch (_) {}
+}
+
+/* ---- listeners -------------------------------------------------------- */
+els.groupSize.addEventListener("input", () => {
+  els.groupSizeOut.textContent = els.groupSize.value;
+});
+
+els.launch.addEventListener("click", () => {
+  if (trainingActive) {
+    stopTraining();
+  } else {
+    startTraining();
+  }
+});
+
+/* ---- init ------------------------------------------------------------- */
 (async function init() {
   await loadConfig();
   applyConfigUI();
-  await loadPresets();
-  resetCanvas(parseInt(els.resolution.value, 10));
+  resetCanvas();
+  
+  // Initial check
   pollWorkers();
   refreshDashboard();
   refreshMetrics();
-  workersTimer = setInterval(() => { pollWorkers(); refreshDashboard(); refreshMetrics(); }, 1500);
+  
+  // Regular polling of workers & dashboard links
+  workersTimer = setInterval(() => {
+    pollWorkers();
+    refreshDashboard();
+    refreshMetrics();
+  }, 2000);
 })();

@@ -5,7 +5,7 @@
 apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
-  name: ray-controller-hc
+  name: dolev-rl-controller-hc
   namespace: ${NAMESPACE}
 spec:
   default:
@@ -17,4 +17,4 @@ spec:
   targetRef:
     group: ""
     kind: Service
-    name: ray-controller
+    name: dolev-rl-controller

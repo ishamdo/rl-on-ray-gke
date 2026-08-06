@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Post-deployment validation for the Ray Render Farm: waits for the controller
-# and Ray head, discovers the Gateway IP, and smoke-tests the data plane.
+# Post-deployment validation for the RL on Ray Training loop: waits for the controller
+# and Ray head, discovers the Gateway IP, and smoke-tests the training API.
 set -e
 
 if [ -f .env ]; then
@@ -11,20 +11,19 @@ else
 fi
 NAMESPACE="${NAMESPACE:-default}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Source of truth is the manifest, not .env (which can drift from the deployed name).
+export KUBECONFIG="${ROOT}/.kubeconfig"
+# Source of truth is the manifest, not .env.
 GATEWAY_NAME=$(awk '/kind: Gateway/{f=1} f&&/^  name:/{print $2; exit}' "${ROOT}/infra/gateway.yaml")
 
 echo "=== Targeting cluster ${CLUSTER_NAME} (${ZONE}) ==="
 gcloud container clusters get-credentials "${CLUSTER_NAME}" --zone="${ZONE}" --project="${PROJECT_ID}"
 
 echo "=== Waiting for the controller and Ray head to be Ready ==="
-kubectl -n "${NAMESPACE}" rollout status deployment/ray-controller-deployment --timeout=300s
+kubectl -n "${NAMESPACE}" rollout status deployment/dolev-rl-controller --timeout=300s
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod \
-  -l ray.io/cluster=ray-render-farm,ray.io/node-type=head --timeout=600s
+  -l ray.io/cluster=dolev-rl-ray-cluster,ray.io/node-type=head --timeout=600s
 
 echo "=== Discovering Gateway IP ==="
-# Prefer the Gateway status; fall back to the GCP forwarding rule (named after the
-# gateway: gkegw1-<hash>-<namespace>-<gateway-name>-<hash>).
 gateway_ip() {
   local ip
   ip=$(kubectl -n "${NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)
@@ -45,9 +44,6 @@ echo "Gateway IP: ${GATEWAY_IP}"
 
 BASE="http://${GATEWAY_IP}"
 
-# A freshly-created L7 gateway reports an IP before its backend + health checks are
-# programmed; until then requests get "connection reset"/"empty reply". Poll
-# /healthz until the data path is actually serving (up to ~8 min).
 echo "=== Waiting for the Gateway data path to be healthy ==="
 HEALTHY=""
 for i in $(seq 1 32); do
@@ -59,28 +55,41 @@ for i in $(seq 1 32); do
   sleep 15
 done
 if [ -z "${HEALTHY}" ]; then
-  echo "Error: Gateway data path not healthy yet (LB still programming). Re-run ./verify_setup.sh shortly."
+  echo "Error: Gateway data path not healthy yet. Re-run ./verify_setup.sh shortly."
   exit 1
 fi
 
 echo "=== Health check ==="
 curl -fsS "${BASE}/healthz" && echo
 
-echo "=== Presets ==="
-curl -fsS "${BASE}/presets" >/dev/null && echo "presets OK"
+echo "=== Status check ==="
+curl -fsS "${BASE}/status" && echo
 
-echo "=== Launching a small render (256px) ==="
-JOB=$(curl -fsS -X POST "${BASE}/render" \
+echo "=== Testing Training Trigger (Start) ==="
+# Trigger training using a small 0.5B model to avoid huge VRAM requirements on tests
+START_RESP=$(curl -fsS -X POST "${BASE}/start" \
   -H 'Content-Type: application/json' \
-  -d '{"preset":"overview","resolution":256,"max_iter":128}' \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
-echo "job_id=${JOB}"
+  -d '{"model_name":"Qwen/Qwen2.5-0.5B-Instruct","lr":1e-4,"batch_size":1,"group_size":2}')
+echo "Start response: ${START_RESP}"
 
-echo "=== Streaming tiles (expect meta + tiles + done) ==="
-# -N: no buffering; -m: cap at 120s in case the cluster is cold (scaling Spot).
-TILES=$(curl -fsS -N -m 120 "${BASE}/render/${JOB}/stream" | grep -c '"type": "tile"' || true)
-echo "tiles streamed: ${TILES}"
-[ "${TILES}" -ge 1 ] || { echo "Error: no tiles streamed."; exit 1; }
+sleep 5
+
+echo "=== Status during starting/training ==="
+curl -fsS "${BASE}/status" && echo
+
+echo "=== Logs stream check ==="
+curl -fsS "${BASE}/logs/stream" | head -n 20
+
+echo "=== Metrics history check ==="
+curl -fsS "${BASE}/metrics" && echo
+
+echo "=== Testing Training Stop ==="
+STOP_RESP=$(curl -fsS -X POST "${BASE}/stop")
+echo "Stop response: ${STOP_RESP}"
+
+sleep 2
+echo "=== Final Status check ==="
+curl -fsS "${BASE}/status" && echo
 
 echo "=== Cluster map (workers endpoint) ==="
 curl -fsS "${BASE}/workers" | python3 -c "import sys,json;d=json.load(sys.stdin);print('pods:',[p['pod_name'] for p in d['pods']])"
@@ -88,4 +97,4 @@ curl -fsS "${BASE}/workers" | python3 -c "import sys,json;d=json.load(sys.stdin)
 echo "=== Verification successful ==="
 DASH_IP=$(kubectl -n "${NAMESPACE}" get svc ray-dashboard -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
 [ -n "${DASH_IP}" ] && echo "Open the Ray Dashboard at: http://${DASH_IP}/" \
-  || echo "Ray Dashboard LoadBalancer still provisioning (kubectl -n ${NAMESPACE} get svc ray-dashboard)"
+  || echo "Ray Dashboard LoadBalancer still provisioning"

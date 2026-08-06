@@ -1,52 +1,39 @@
-"""Hub data-plane router for the Ray Render Farm feature.
+"""Hub data-plane router for the Ray RL Training feature.
 
 Mounted by the Hub at ``/api/features/ray`` behind the admin JWT. Kept thin:
 
 * **LIVE** — the browser talks to the controller directly via the Gateway IP
-  (CORS) for the heavy data plane (render + SSE + workers). This router only
-  resolves ``/config`` (gateway IP + Ray Dashboard URL) using the shared SDK.
+  (CORS) for the heavy data plane (start, stop, status, metrics, logs, workers).
 * **MOCK** — no cluster exists, so this router serves the *entire* surface
-  (``/config``, ``/presets``, ``/render``, the SSE stream, ``/workers``) with
-  deterministic data, including a synthetic autoscaling curve. Tiles are real
-  PNGs encoded with a tiny pure-stdlib encoder, so the playroom animates fully
-  offline without Pillow/numpy in the Hub image.
+  (``/config``, ``/start``, ``/stop``, ``/status``, ``/metrics``, ``/logs/stream``, ``/workers``)
+  with deterministic simulated data, showing an accuracy improvement curve.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
-import struct
+import random
+import time
 import uuid
-import zlib
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 
 # --------------------------------------------------------------------------- #
-# Shared SDK — imported tolerantly so the router also loads standalone/in tests.
+# Shared SDK
 # --------------------------------------------------------------------------- #
-try:  # pragma: no cover - exercised inside the Hub container
+try:  # pragma: no cover
     from showcase_admin.app import config, database, k8s_client
-except Exception:  # standalone / unit tests
+except Exception:
     config = None
     database = None
     k8s_client = None
 
 
 def _mode() -> str:
-    """Resolve the current mode *dynamically* (never cache at import).
-
-    The Hub's test harness sets ``MODE=MOCK`` after this module is imported, so a
-    value captured at import time would go stale and the mock data plane would never
-    activate. Prefer the live ``config.MODE`` when the Hub SDK is present, else the
-    ``MODE`` env var (standalone / unit tests), defaulting to MOCK.
-    """
     if config is not None:
         return getattr(config, "MODE", "MOCK")
     import os
-
     return os.environ.get("MODE", "MOCK").upper()
 
 
@@ -55,80 +42,113 @@ GATEWAY_NAME = "ray-render-gw"
 
 router = APIRouter()
 
-PRESETS = {
-    "overview": {"center_x": -0.5, "center_y": 0.0, "zoom": 1.6},
-    "seahorse": {"center_x": -0.745, "center_y": 0.113, "zoom": 0.02},
-    "spiral": {"center_x": -0.7435, "center_y": 0.1314, "zoom": 0.0035},
-    "elephant": {"center_x": 0.275, "center_y": 0.007, "zoom": 0.02},
-    "minibrot": {"center_x": -1.7687, "center_y": 0.0017, "zoom": 0.004},
+# --------------------------------------------------------------------------- #
+# MOCK state
+# --------------------------------------------------------------------------- #
+_MOCK_STATE = {
+    "status": "idle",
+    "active": False,
+    "framework": "custom",
+    "step": 0,
+    "metrics": {
+        "steps": [],
+        "loss": [],
+        "reward": []
+    },
+    "logs": []
 }
 
-TILE_PX = 128
-MAX_MOCK_WORKERS = 6
+_MOCK_PODS = [
+    {"pod_name": "ray-render-farm-head", "node_type": "head", "status": "Running", "node": "node-default"}
+]
+
+_MOCK_TASK = None
 
 
-# --------------------------------------------------------------------------- #
-# Tiny pure-stdlib PNG encoder (solid-color RGB square). MOCK only.
-# --------------------------------------------------------------------------- #
-def _solid_png(r: int, g: int, b: int, size: int = 64) -> str:
-    import base64
+async def _simulate_training():
+    global _MOCK_STATE, _MOCK_PODS
+    
+    _MOCK_STATE["status"] = "starting"
+    _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Connecting to Ray Cluster at ray://ray-render-farm-head-svc:10001...")
+    
+    if _MOCK_STATE["framework"] == "verl":
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Initializing veRL HybridFlow pipeline...")
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Configuring model placements:")
+        _MOCK_STATE["logs"].append(f"  - Actor strategy: FSDP (allocated to ray-verl-actor-0)")
+        _MOCK_STATE["logs"].append(f"  - Reference strategy: FSDP (allocated to ray-verl-ref-0)")
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Allocating GPUs and loading Qwen weights...")
+        
+        await asyncio.sleep(2.0)
+        
+        if len(_MOCK_PODS) == 1:
+            _MOCK_PODS.append({
+                "pod_name": "ray-verl-actor-0",
+                "node_type": "worker",
+                "status": "Running",
+                "node": "gpu-spot-node-0"
+            })
+            _MOCK_PODS.append({
+                "pod_name": "ray-verl-ref-0",
+                "node_type": "worker",
+                "status": "Running",
+                "node": "gpu-spot-node-1"
+            })
+        
+        _MOCK_STATE["status"] = "training"
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] veRL HybridEngine active on 2 GPUs.")
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Starting GRPO training on GSM8K dataset...")
+    else:
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Allocating GPU and initializing RLTrainer Actor...")
+        
+        await asyncio.sleep(2.0)
+        
+        if len(_MOCK_PODS) == 1:
+            _MOCK_PODS.append({
+                "pod_name": "ray-render-farm-worker-0",
+                "node_type": "worker",
+                "status": "Running",
+                "node": "gpu-spot-node-0"
+            })
+            
+        _MOCK_STATE["status"] = "training"
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Model loaded successfully on GPU!")
+        _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Starting GRPO alignment loop on GSM8K math dataset...")
 
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)  # 8-bit RGB
-    row = b"\x00" + bytes([r, g, b]) * size  # filter byte + pixels
-    raw = row * size
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(raw, 6))
-        + chunk(b"IEND", b"")
-    )
-    return base64.b64encode(png).decode("ascii")
-
-
-def _hue_rgb(i: int) -> tuple[int, int, int]:
-    """Distinct color per pod index (golden-angle hue stepping)."""
-    h = (i * 0.61803398875) % 1.0
-    k = h * 6.0
-    c = 200
-    x = int(c * (1 - abs((k % 2) - 1)))
-    base = 40
-    table = [(c, x, 0), (x, c, 0), (0, c, x), (0, x, c), (x, 0, c), (c, 0, x)]
-    r, g, b = table[int(k) % 6]
-    return base + r, base + g, base + b
-
-
-# --------------------------------------------------------------------------- #
-# MOCK render state
-# --------------------------------------------------------------------------- #
-_MOCK_JOBS: dict[str, dict] = {}
-_MOCK_PODS: list[dict] = [{"pod_name": "ray-render-farm-head", "node_type": "head",
-                           "status": "Running", "node": "node-pool-default"}]
-_MOCK_CLOCK = {"t": 0.0}  # virtual time (advanced by stream), avoids Date.now()
-
-
-def _mock_reset_pods() -> None:
-    _MOCK_PODS[:] = [
-        {"pod_name": "ray-render-farm-head", "node_type": "head",
-         "status": "Running", "node": "node-pool-default"},
-        {"pod_name": "ray-render-farm-worker-0", "node_type": "worker",
-         "status": "Running", "node": "spot-pool-0"},
-    ]
-
-
-def _mock_add_worker() -> dict:
-    idx = sum(1 for p in _MOCK_PODS if p["node_type"] == "worker")
-    pod = {"pod_name": f"ray-render-farm-worker-{idx}", "node_type": "worker",
-           "status": "Running", "node": f"spot-pool-{idx}"}
-    _MOCK_PODS.append(pod)
-    return pod
+    loss = 1.2
+    acc = 0.10
+    
+    while _MOCK_STATE["active"]:
+        await asyncio.sleep(1.5)
+        _MOCK_STATE["step"] += 1
+        step = _MOCK_STATE["step"]
+        
+        loss = max(0.05, loss - random.uniform(0.02, 0.08))
+        acc = min(0.95, acc + random.uniform(0.01, 0.06))
+        
+        _MOCK_STATE["metrics"]["steps"].append(step)
+        _MOCK_STATE["metrics"]["loss"].append(loss)
+        _MOCK_STATE["metrics"]["reward"].append(acc)
+        
+        if _MOCK_STATE["framework"] == "verl":
+            gen_time = random.uniform(1.2, 1.8)
+            ref_time = random.uniform(0.4, 0.6)
+            log_line = f"step:{step} - timing/gen:{gen_time:.3f} - timing/ref:{ref_time:.3f} - actor/policy_loss:{loss:.4f} - actor/total_reward:{acc:.4f} - val/test_score/openai/gsm8k:{acc:.4f}"
+            _MOCK_STATE["logs"].append(log_line)
+            # Tag which worker did rollout/training
+            _MOCK_STATE["logs"].append(f"  [veRL] Rollouts generated on worker: ray-verl-actor-0")
+        else:
+            log_line = f"[{time.strftime('%X')}] Step {step} | Loss: {loss:.4f} | Avg Acc: {acc:.2%} | Time: 1.2s | Worker: ray-render-farm-worker-0"
+            _MOCK_STATE["logs"].append(log_line)
+            
+            q = f"If Tom has {step} apples and Jerry takes {random.randint(1, 3)}, how many are left?"
+            ans = step - 1
+            _MOCK_STATE["logs"].append(f"  Question: {q}")
+            _MOCK_STATE["logs"].append(f"  Target: Tom had {step} apples.Jerry took some. Left: {ans}\n#### {ans}")
+            _MOCK_STATE["logs"].append(f"    Rollout 1: Reward 1.0 | Adv 0.50 | Ans: Tom has {ans} apples left. #### {ans}")
+            _MOCK_STATE["logs"].append(f"    Rollout 2: Reward 0.0 | Adv -0.50 | Ans: Tom has 10 apples left. #### 10")
+        
+        if len(_MOCK_STATE["logs"]) > 200:
+            _MOCK_STATE["logs"] = _MOCK_STATE["logs"][-200:]
 
 
 # --------------------------------------------------------------------------- #
@@ -139,10 +159,6 @@ async def config_endpoint() -> dict:
     if _mode() == "MOCK":
         return {"mode": "MOCK", "gateway_ip": None, "dashboard_url": None}
 
-    # LIVE: resolve the feature's deployed namespace, then this feature's Gateway IP so the
-    # browser can reach the controller's data plane directly (CORS). get_gateway_ip is async
-    # and takes (namespace, gateway_name) — a swapped/un-awaited call here returns no IP, the
-    # frontend falls back to the Hub path, and the unauthenticated render POST 401s.
     gateway_ip = None
     if database is not None and k8s_client is not None:
         db = next(database.get_db())
@@ -153,82 +169,85 @@ async def config_endpoint() -> dict:
             gateway_ip = None
         finally:
             db.close()
-    # The Ray Dashboard has its own LoadBalancer; the playroom resolves it via the
-    # controller's /dashboard endpoint (data plane), not a gateway path.
     return {"mode": "LIVE", "gateway_ip": gateway_ip, "dashboard_url": None}
 
 
-@router.get("/presets")
-def presets() -> dict:
-    return PRESETS
-
-
-@router.post("/render")
-async def render(req: dict) -> dict:
-    """MOCK render planner. (LIVE renders go straight to the Gateway IP.)"""
+@router.post("/start")
+async def start_training(req: dict) -> dict:
+    global _MOCK_STATE, _MOCK_TASK, _MOCK_PODS
     if _mode() != "MOCK":
-        raise HTTPException(
-            status_code=409,
-            detail="LIVE render runs on the Gateway IP, not the Hub router.",
-        )
-    resolution = int(req.get("resolution", 1024))
-    per_row = max(1, math.ceil(resolution / TILE_PX))
-    total = per_row * per_row
-    job_id = uuid.uuid4().hex[:12]
-    _MOCK_JOBS[job_id] = {"total": total, "per_row": per_row, "resolution": resolution}
-    _mock_reset_pods()
-    return {"job_id": job_id}
+        raise HTTPException(status_code=409, detail="LIVE start runs on Gateway IP.")
+        
+    if _MOCK_STATE["active"]:
+        return {"status": "already_running"}
+        
+    _MOCK_STATE["active"] = True
+    _MOCK_STATE["framework"] = req.get("framework", "custom")
+    _MOCK_STATE["step"] = 0
+    _MOCK_STATE["metrics"]["steps"].clear()
+    _MOCK_STATE["metrics"]["loss"].clear()
+    _MOCK_STATE["metrics"]["reward"].clear()
+    _MOCK_STATE["logs"].clear()
+    _MOCK_PODS[:] = [
+        {"pod_name": "ray-render-farm-head", "node_type": "head", "status": "Running", "node": "node-default"}
+    ]
+    
+    _MOCK_TASK = asyncio.create_task(_simulate_training())
+    return {"status": "started"}
 
 
-@router.get("/render/{job_id}/stream")
-async def stream(job_id: str) -> StreamingResponse:
+@router.post("/stop")
+async def stop_training() -> dict:
+    global _MOCK_STATE, _MOCK_TASK, _MOCK_PODS
     if _mode() != "MOCK":
-        raise HTTPException(status_code=409, detail="LIVE stream is on the Gateway IP.")
-    job = _MOCK_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="unknown job")
+        raise HTTPException(status_code=409, detail="LIVE stop runs on Gateway IP.")
+        
+    if not _MOCK_STATE["active"]:
+        return {"status": "not_running"}
+        
+    _MOCK_STATE["active"] = False
+    if _MOCK_TASK:
+        _MOCK_TASK.cancel()
+        _MOCK_TASK = None
+        
+    _MOCK_STATE["status"] = "idle"
+    _MOCK_STATE["logs"].append(f"[{time.strftime('%X')}] Training loop stopped.")
+    
+    # Remove mock workers on stop
+    _MOCK_PODS[:] = [
+        {"pod_name": "ray-render-farm-head", "node_type": "head", "status": "Running", "node": "node-default"}
+    ]
+    return {"status": "stopping"}
 
-    per_row = job["per_row"]
-    total = job["total"]
-    res = job["resolution"]
-    # Keep the whole animation to a few seconds regardless of tile count.
-    delay = min(0.06, 6.0 / max(total, 1))
-    # Grow workers across the run to mimic the autoscaler reacting to demand.
-    add_every = max(1, total // MAX_MOCK_WORKERS)
 
-    async def gen():
-        yield f'data: {json.dumps({"type": "meta", "tiles": total, "tile_px": TILE_PX, "width": res, "height": res})}\n\n'
-        start = _MOCK_CLOCK["t"]
-        for i in range(total):
-            if i and i % add_every == 0 and sum(
-                1 for p in _MOCK_PODS if p["node_type"] == "worker"
-            ) < MAX_MOCK_WORKERS:
-                _mock_add_worker()
-            workers = [p for p in _MOCK_PODS if p["node_type"] == "worker"]
-            pod = workers[i % len(workers)]
-            pidx = int(pod["pod_name"].rsplit("-", 1)[-1])
-            r, g, b = _hue_rgb(pidx)
-            row, col = divmod(i, per_row)
-            tile = {
-                "type": "tile", "index": i,
-                "x": col * TILE_PX, "y": row * TILE_PX,
-                "w": TILE_PX, "h": TILE_PX,
-                "png_base64": _solid_png(r, g, b, 32),
-                "pod_name": pod["pod_name"], "ms": 40,
-            }
-            _MOCK_CLOCK["t"] += delay
-            yield f"data: {json.dumps(tile)}\n\n"
-            await asyncio.sleep(delay)
-        elapsed = int((_MOCK_CLOCK["t"] - start) * 1000)
-        yield f'data: {json.dumps({"type": "done", "elapsed_ms": elapsed})}\n\n'
-        _MOCK_JOBS.pop(job_id, None)
+@router.get("/status")
+def get_status() -> dict:
+    if _mode() != "MOCK":
+        raise HTTPException(status_code=409, detail="LIVE status is on Gateway IP.")
+    return {
+        "status": _MOCK_STATE["status"],
+        "active": _MOCK_STATE["active"],
+        "error": None,
+        "total_steps": len(_MOCK_STATE["metrics"]["steps"])
+    }
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+
+@router.get("/metrics")
+def get_metrics() -> dict:
+    if _mode() != "MOCK":
+        raise HTTPException(status_code=409, detail="LIVE metrics is on Gateway IP.")
+    return _MOCK_STATE["metrics"]
+
+
+@router.get("/logs/stream")
+def stream_logs() -> dict:
+    if _mode() != "MOCK":
+        raise HTTPException(status_code=409, detail="LIVE logs are on Gateway IP.")
+    return {"logs": _MOCK_STATE["logs"]}
 
 
 @router.get("/workers")
 def workers() -> dict:
     if _mode() != "MOCK":
-        raise HTTPException(status_code=409, detail="LIVE workers are on the Gateway IP.")
-    return {"namespace": "gke-showcase-ray", "cluster": "ray-render-farm",
-            "pods": list(_MOCK_PODS)}
+        raise HTTPException(status_code=409, detail="LIVE workers are on Gateway IP.")
+    return {"namespace": "gke-showcase-ray", "cluster": "dolev-rl-ray-cluster", "pods": _MOCK_PODS}

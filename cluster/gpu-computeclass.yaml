@@ -1,0 +1,16 @@
+# Spot GPU ComputeClass for Ray workers. GKE's Node Auto-Provisioning (NAP)
+# will auto-create Spot g2-standard-4 node pools equipped with NVIDIA L4 GPUs.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: ray-gpu
+spec:
+  priorities:
+    - machineFamily: g2
+      spot: true
+  # Let GKE create Spot GPU node pools on demand and scale them back to zero.
+  nodePoolAutoCreation:
+    enabled: true
+  whenUnsatisfiable: ScaleUpAnyway
+  activeMigration:
+    optimizeRulePriority: true

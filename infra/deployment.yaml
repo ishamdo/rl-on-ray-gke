@@ -3,23 +3,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ray-controller-deployment
+  name: dolev-rl-controller
   namespace: ${NAMESPACE}
   labels:
-    app: ray-controller
+    app: dolev-rl-controller
 spec:
   replicas: 1
   # First rollout pulls the multi-GB Ray image; give it room before failing.
   progressDeadlineSeconds: 900
   selector:
     matchLabels:
-      app: ray-controller
+      app: dolev-rl-controller
   template:
     metadata:
       labels:
-        app: ray-controller
+        app: dolev-rl-controller
     spec:
-      serviceAccountName: ray-controller
+      serviceAccountName: dolev-rl-controller
       containers:
         - name: controller
           image: ${RAY_IMAGE}
@@ -32,9 +32,9 @@ spec:
           env:
             # Bare service name resolves within this namespace (namespace-portable).
             - name: RAY_ADDRESS
-              value: "ray://ray-render-farm-head-svc:10001"
+              value: "ray://dolev-rl-ray-cluster-head-svc:10001"
             - name: RAY_CLUSTER_NAME
-              value: "ray-render-farm"
+              value: "dolev-rl-ray-cluster"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

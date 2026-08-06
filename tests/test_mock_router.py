@@ -2,7 +2,7 @@
 
 import json
 import os
-
+import time
 import pytest
 
 os.environ["MODE"] = "MOCK"
@@ -22,61 +22,55 @@ def client():
     return TestClient(app)
 
 
-def _events(text: str):
-    return [json.loads(l[5:].strip()) for l in text.splitlines() if l.startswith("data:")]
-
-
 def test_config_mock(client):
     r = client.get("/api/features/ray/config")
     assert r.status_code == 200
     body = r.json()
     assert body["mode"] == "MOCK"
-    assert body["gateway_ip"] is None  # nothing to link to offline
+    assert body["gateway_ip"] is None
 
 
-def test_presets(client):
-    r = client.get("/api/features/ray/presets")
+def test_training_flow_simulated(client):
+    # Check initial status is idle
+    r = client.get("/api/features/ray/status")
     assert r.status_code == 200
-    assert "seahorse" in r.json()
+    assert r.json()["status"] == "idle"
 
-
-def test_solid_png_is_valid():
-    import base64
-
-    png = base64.b64decode(hub_router._solid_png(10, 20, 30, 16))
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
-
-
-def test_render_then_stream_paints_and_autoscales(client):
-    # 256px @ 128px tiles -> 2x2 = 4 tiles.
-    r = client.post("/api/features/ray/render", json={"resolution": 256})
+    # Start training
+    r = client.post("/api/features/ray/start", json={})
     assert r.status_code == 200
-    job_id = r.json()["job_id"]
+    assert r.json()["status"] == "started"
 
-    s = client.get(f"/api/features/ray/render/{job_id}/stream")
-    assert s.status_code == 200
-    events = _events(s.text)
+    # Status should be starting or training
+    r = client.get("/api/features/ray/status")
+    assert r.status_code == 200
+    assert r.json()["status"] in ["starting", "training"]
 
-    meta = events[0]
-    assert meta["type"] == "meta" and meta["tiles"] == 4
-    tiles = [e for e in events if e["type"] == "tile"]
-    assert len(tiles) == 4
-    # Every tile attributed to a worker pod and carries pixels.
-    assert all(t["pod_name"].startswith("ray-render-farm-worker") for t in tiles)
-    assert all(t["png_base64"] for t in tiles)
-    assert events[-1]["type"] == "done"
+    # Sleep briefly to let the simulated training run a step
+    # Note: since mock training uses asyncio.sleep, we have to make sure it yields.
+    # In test TestClient, it runs in the same thread, so let's check logs
+    time.sleep(0.1)
+
+    r = client.get("/api/features/ray/logs/stream")
+    assert r.status_code == 200
+    assert "logs" in r.json()
+
+    r = client.get("/api/features/ray/metrics")
+    assert r.status_code == 200
+    assert "steps" in r.json()
+
+    # Stop training
+    r = client.post("/api/features/ray/stop")
+    assert r.status_code == 200
+    assert r.json()["status"] == "stopping"
+
+    # Final status should go back to idle
+    r = client.get("/api/features/ray/status")
+    assert r.status_code == 200
+    assert r.json()["status"] == "idle"
 
 
-def test_workers_includes_head(client):
-    # Run a render first so the autoscaler mock has populated workers.
-    job = client.post("/api/features/ray/render", json={"resolution": 512}).json()["job_id"]
-    client.get(f"/api/features/ray/render/{job}/stream")
+def test_workers_mock(client):
     pods = client.get("/api/features/ray/workers").json()["pods"]
     types = {p["node_type"] for p in pods}
     assert "head" in types
-    assert "worker" in types
-
-
-def test_stream_unknown_job_404(client):
-    r = client.get("/api/features/ray/render/nope/stream")
-    assert r.status_code == 404

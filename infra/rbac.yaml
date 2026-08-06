@@ -4,13 +4,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: ray-controller
+  name: dolev-rl-controller
   namespace: ${NAMESPACE}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: ray-controller-pod-reader
+  name: dolev-rl-controller-pod-reader
   namespace: ${NAMESPACE}
 rules:
   - apiGroups: [""]
@@ -28,13 +28,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: ray-controller-pod-reader
+  name: dolev-rl-controller-pod-reader
   namespace: ${NAMESPACE}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: ray-controller-pod-reader
+  name: dolev-rl-controller-pod-reader
 subjects:
   - kind: ServiceAccount
-    name: ray-controller
+    name: dolev-rl-controller
     namespace: ${NAMESPACE}

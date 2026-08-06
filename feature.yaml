@@ -1,15 +1,15 @@
 # Showcase feature descriptor — see gke_all /feature.md for the full contract.
-name: ray
-title: Distributed Compute with Ray (KubeRay)
+name: dolev_rl_ray
+title: RL on Ray — GKE L4 GPU
 description: >-
-  Render the Mandelbrot set as a distributed Ray job and watch KubeRay autoscale
-  worker pods across Spot nodes in real time — tiles painting in, pods spinning
-  up, results streaming back, with a live link to the Ray Dashboard.
+  Run a distributed GRPO training loop on Ray and watch KubeRay autoscale GPU
+  worker pods across Spot L4 GPU nodes in real time — loss decreasing, accuracy
+  scaling up, with a live link to the Ray Dashboard.
 gke_features:
   - KubeRay Operator
-  - RayCluster Autoscaling
-  - Spot VMs / ComputeClass
-  - Distributed Task Fan-out
+  - RayCluster GPU Autoscaling
+  - Spot GPUs / ComputeClass
+  - Distributed RL Training (GRPO)
 
 paths:
   infra_dir: infra
@@ -17,21 +17,14 @@ paths:
   frontend_dir: frontend
   playroom_slug: ray
 
-# Hub polls this Deployment for readiness (ready_replicas == replicas).
-deployment_name: ray-controller-deployment
+# Hub polls this Deployment for readiness
+deployment_name: dolev-rl-controller
 gateway:
-  # Modern class -> a DEDICATED external LB per Gateway (the classic gke-l7-gxlb
-  # shares one LB per cluster, which collides with other features' routes).
-  name: ray-render-gw
+  name: dolev-rl-ray-gw
   class: gke-l7-global-external-managed
 
-# Single image: Ray runtime + the tile task module + the FastAPI controller.
-# Used for the controller Deployment AND the RayCluster head/worker pods, so the
-# Ray Client version on the driver always matches the cluster.
 build:
-  # Context is the feature root so the image can also bake in frontend/ (for
-  # standalone UI serving); the Dockerfile copies app/ and frontend/.
-  - image: ray-render-farm
+  - image: dolev-rl-ray-image
     context: .
     dockerfile: app/Dockerfile
 
@@ -45,10 +38,11 @@ template_vars:
 template_defaults:
   NAMESPACE: default
   # Image reference assembled from Hub-standard vars; overridable standalone.
-  RAY_IMAGE: "${REGION}-docker.pkg.dev/${PROJECT_NAME}/${ARTIFACT_REGISTRY_REPO}/ray-render-farm:latest"
+  RAY_IMAGE: "${REGION}-docker.pkg.dev/${PROJECT_NAME}/${ARTIFACT_REGISTRY_REPO}/dolev-rl-ray-image:latest"
   # RayCluster worker autoscaling bounds (the live "worker cap").
   WORKER_MIN_REPLICAS: "0"
   WORKER_MAX_REPLICAS: "6"
 
 # This feature's own data-plane router, mounted by the Hub at /api/features/ray.
 hub_router: "hub_router:router"
+

@@ -9,11 +9,11 @@ metadata:
   name: ray-metrics
   namespace: ${NAMESPACE}
   labels:
-    app: ray-render-farm
+    app: dolev-rl-ray-cluster
 spec:
   selector:
     matchLabels:
-      ray.io/cluster: ray-render-farm
+      ray.io/cluster: dolev-rl-ray-cluster
   endpoints:
     - port: metrics
       path: /metrics

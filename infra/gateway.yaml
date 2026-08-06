@@ -3,7 +3,7 @@
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: ray-render-gw
+  name: dolev-rl-ray-gw
   namespace: ${NAMESPACE}
 spec:
   # Modern global external ALB: a DEDICATED load balancer per Gateway. (The

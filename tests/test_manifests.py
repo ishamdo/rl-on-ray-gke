@@ -29,7 +29,8 @@ def test_feature_yaml_required_keys():
     for key in ("name", "paths", "deployment_name", "gateway"):
         assert key in f, f"feature.yaml missing {key}"
     assert f["name"] == "ray"
-    assert f["gateway"]["name"] == "ray-gateway"
+    assert f["gateway"]["name"] == "ray-render-gw"
+
 
 
 def test_exactly_one_ui_model():
@@ -155,7 +156,7 @@ def test_raycluster_autoscaling_and_spot():
     assert worker["minReplicas"] == "${WORKER_MIN_REPLICAS}"
     assert worker["maxReplicas"] == "${WORKER_MAX_REPLICAS}"
     sel = worker["template"]["spec"]["nodeSelector"]
-    assert sel["cloud.google.com/compute-class"] == "ray-spot"
+    assert sel["cloud.google.com/compute-class"] == "ray-gpu"
     # POD_NAME via downward API for tile attribution.
     env = worker["template"]["spec"]["containers"][0]["env"]
     assert any(e["name"] == "POD_NAME" for e in env)

@@ -1,58 +1,53 @@
-"""Unit tests for the Mandelbrot tile logic (no Ray cluster needed)."""
-
-import base64
+"""Unit tests for the RL Trainer logic (no GPU or Ray cluster needed)."""
 
 import pytest
+import sys
+import os
 
-pytest.importorskip("numpy")
-pytest.importorskip("PIL")
-pytest.importorskip("ray")
-
-import tasks  # noqa: E402
-
-
-def test_build_tile_specs_tiles_cover_image():
-    specs = tasks.build_tile_specs(
-        width=256, height=256, tile=128,
-        center_x=-0.5, center_y=0.0, zoom=1.6, max_iter=64,
-    )
-    assert len(specs) == 4  # 2x2
-    assert {s.index for s in specs} == {0, 1, 2, 3}
-    # Tiles fully cover the image with no gaps/overlap.
-    covered = sum(s.pw * s.ph for s in specs)
-    assert covered == 256 * 256
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "app"))
+import tasks
 
 
-def test_build_tile_specs_handles_ragged_edges():
-    specs = tasks.build_tile_specs(
-        width=300, height=300, tile=128,
-        center_x=-0.5, center_y=0.0, zoom=1.6, max_iter=32,
-    )
-    assert len(specs) == 9  # 3x3 (128,128,44)
-    edge = [s for s in specs if s.pw == 44 or s.ph == 44]
-    assert edge, "expected ragged edge tiles"
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("The answer is #### 42", "42"),
+        ("Reasoning here... #### 125", "125"),
+        ("So we get #### -5.5\n", "-5.5"),
+        ("Therefore, the answer is \\boxed{16}", "16"),
+        ("Using the formula: \\boxed{ 42.5 }.", "42.5"),
+        ("We conclude that the answer is 12.", "12"),
+        ("No numbers here.", None),
+    ]
+)
+def test_extract_answer(text, expected):
+    # Instantiate trainer without loading heavy model for simple test
+    # We will test the class method by calling the underlying logic or using a mock trainer
+    # Actually, extract_answer is a method on RLTrainer, but it doesn't use self.
+    # Let's inspect if we can call it on a dummy class or just test the logic.
+    # Let's define a mock class or call the method directly.
+    class DummyTrainer:
+        extract_answer = tasks.RLTrainer.extract_answer
+        reward_fn = tasks.RLTrainer.reward_fn
+        
+    trainer = DummyTrainer()
+    assert trainer.extract_answer(text) == expected
 
 
-def test_render_tile_pixels_returns_valid_png():
-    spec = tasks.build_tile_specs(
-        width=128, height=128, tile=128,
-        center_x=-0.5, center_y=0.0, zoom=1.6, max_iter=64,
-    )[0]
-    png = tasks._render_tile_pixels(spec)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
-
-
-def test_render_tile_payload_shape(monkeypatch):
-    """Call the remote function's wrapped body directly (no Ray runtime)."""
-    monkeypatch.setenv("POD_NAME", "ray-render-farm-worker-3")
-    spec = tasks.build_tile_specs(
-        width=128, height=128, tile=128,
-        center_x=-0.5, center_y=0.0, zoom=1.6, max_iter=48,
-    )[0]
-    # render_tile is a Ray remote; invoke the undecorated function body.
-    fn = tasks.render_tile._function  # underlying python callable
-    out = fn(spec)
-    assert out["pod_name"] == "ray-render-farm-worker-3"
-    assert out["index"] == 0
-    assert {"x", "y", "w", "h", "png_base64", "ms"} <= out.keys()
-    base64.b64decode(out["png_base64"])  # decodes cleanly
+@pytest.mark.parametrize(
+    "completion,target,expected_reward",
+    [
+        ("The final result is #### 50", "The answer is #### 50", 1.0),
+        ("We boxed the answer: \\boxed{12}", "#### 12", 1.0),
+        ("The count is 5", "#### 10", 0.0),
+        ("No answer", "#### 5", 0.0),
+        ("The answer is #### 10.5", "#### 10.5", 1.0),
+    ]
+)
+def test_reward_fn(completion, target, expected_reward):
+    class DummyTrainer:
+        extract_answer = tasks.RLTrainer.extract_answer
+        reward_fn = tasks.RLTrainer.reward_fn
+        
+    trainer = DummyTrainer()
+    assert trainer.reward_fn(completion, target) == expected_reward

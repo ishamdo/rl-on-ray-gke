@@ -16,6 +16,7 @@ fi
 REGION="${REGION:-${ZONE%-*}}"
 NAMESPACE="${NAMESPACE:-default}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export KUBECONFIG="${ROOT}/.kubeconfig"
 
 # --reset-gateway: delete the Gateway + HTTPRoute before applying, forcing the
 # GKE controller to reconcile them fresh. Use this if the Gateway is wedged
@@ -31,7 +32,7 @@ esac
 # Per-cluster image tag so multiple clusters never clobber each other's image.
 IMAGE_TAG="${IMAGE_TAG:-${CLUSTER_NAME}}"
 REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}"
-RAY_IMAGE="${REGISTRY}/ray-render-farm:${IMAGE_TAG}"
+RAY_IMAGE="${REGISTRY}/dolev-rl-ray-image:${IMAGE_TAG}"
 
 # Source of truth for the gateway name is the manifest, not .env (which can drift
 # from the deployed name and make IP discovery look up the wrong gateway).
@@ -49,15 +50,9 @@ gcloud artifacts repositories create "${ARTIFACT_REGISTRY_REPO}" \
   --description="Ray Render Farm images" --project="${PROJECT_ID}" \
   || echo "Repo may already exist; continuing."
 
-echo "=== Authenticating Docker to ${REGION}-docker.pkg.dev ==="
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-
-echo "=== Building image (linux/amd64 for GKE nodes): ${RAY_IMAGE} ==="
-# Context is the repo root so the image can include both app/ and frontend/.
-docker build --platform linux/amd64 -t "${RAY_IMAGE}" -f "${ROOT}/app/Dockerfile" "${ROOT}"
-
-echo "=== Pushing image ==="
-docker push "${RAY_IMAGE}"
+echo "=== Building and Pushing image via Google Cloud Build: ${RAY_IMAGE} ==="
+gcloud builds submit --project="${PROJECT_ID}" --config="${ROOT}/cloudbuild.yaml" \
+  --substitutions=_IMAGE="${RAY_IMAGE}" --timeout=1200s "${ROOT}"
 
 echo "=== Deploying per-namespace infra into: ${NAMESPACE} ==="
 # Create the namespace only if missing (avoids the kubectl-apply annotation
@@ -110,16 +105,16 @@ echo "=== Restarting Ray pods to pick up the latest image ==="
 # so the head would keep running a stale image (and stale task code). Delete the Ray
 # pods; KubeRay recreates the head (imagePullPolicy: Always pulls the rebuild).
 # Workers are autoscaled from 0, so there are usually none to delete.
-kubectl -n "${NAMESPACE}" delete pod -l ray.io/cluster=ray-render-farm --ignore-not-found
+kubectl -n "${NAMESPACE}" delete pod -l ray.io/cluster=dolev-rl-ray-cluster --ignore-not-found
 sleep 10
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod \
-  -l ray.io/cluster=ray-render-farm,ray.io/node-type=head --timeout=300s || true
+  -l ray.io/cluster=dolev-rl-ray-cluster,ray.io/node-type=head --timeout=300s || true
 
 echo "=== Rolling out the controller ==="
 # Force a fresh pull of the rebuilt image (stable per-cluster tag + Always policy).
 # After the head restart so the controller's Ray Client connects to the new head.
-kubectl -n "${NAMESPACE}" rollout restart deployment/ray-controller-deployment
-kubectl -n "${NAMESPACE}" rollout status deployment/ray-controller-deployment --timeout=600s || true
+kubectl -n "${NAMESPACE}" rollout restart deployment/dolev-rl-controller
+kubectl -n "${NAMESPACE}" rollout status deployment/dolev-rl-controller --timeout=600s || true
 
 echo "=== Deployed. Discovering Gateway IP (may take 3-5 minutes) ==="
 # Prefer the Gateway status; fall back to the GCP forwarding rule (named after the

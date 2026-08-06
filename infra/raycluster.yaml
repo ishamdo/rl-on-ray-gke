@@ -6,10 +6,10 @@
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: ray-render-farm
+  name: dolev-rl-ray-cluster
   namespace: ${NAMESPACE}
   labels:
-    app: ray-render-farm
+    app: dolev-rl-ray-cluster
 spec:
   rayVersion: "2.40.0"
   enableInTreeAutoscaling: true
@@ -46,13 +46,16 @@ spec:
         metrics-export-port: "8080"   # Prometheus metrics (scraped by GMP)
       template:
         spec:
-          # Land workers on Spot capacity via the cluster-scoped ComputeClass.
+          # Land workers on Spot GPU capacity via the cluster-scoped ComputeClass.
           nodeSelector:
-            cloud.google.com/compute-class: ray-spot
+            cloud.google.com/compute-class: ray-gpu
           tolerations:
             - key: cloud.google.com/gke-spot
               operator: Equal
               value: "true"
+              effect: NoSchedule
+            - key: nvidia.com/gpu
+              operator: Exists
               effect: NoSchedule
           containers:
             - name: ray-worker
@@ -68,5 +71,5 @@ spec:
               ports:
                 - { containerPort: 8080, name: metrics }
               resources:
-                requests: { cpu: "1", memory: 2Gi }
-                limits: { cpu: "2", memory: 4Gi }
+                requests: { cpu: "2", memory: 8Gi, nvidia.com/gpu: "1" }
+                limits: { cpu: "4", memory: 16Gi, nvidia.com/gpu: "1" }

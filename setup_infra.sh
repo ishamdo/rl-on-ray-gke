@@ -82,7 +82,8 @@ else
     --enable-managed-prometheus \
     --enable-autoprovisioning \
     --min-cpu 0 --max-cpu "${MAX_CPU:-200}" \
-    --min-memory 0 --max-memory "${MAX_MEMORY:-800}"
+    --min-memory 0 --max-memory "${MAX_MEMORY:-800}" \
+    --max-accelerator="type=nvidia-l4,count=50"
 fi
 
 echo "=== Step 2: Getting cluster credentials ==="

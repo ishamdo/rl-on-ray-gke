@@ -16,3 +16,4 @@ resources:
   - namespace.yaml
   - kuberay-operator
   - spot-computeclass.yaml
+  - gpu-computeclass.yaml

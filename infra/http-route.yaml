@@ -6,16 +6,16 @@
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: ray-route
+  name: dolev-rl-ray-route
   namespace: ${NAMESPACE}
 spec:
   parentRefs:
-    - name: ray-render-gw
+    - name: dolev-rl-ray-gw
   rules:
     - matches:
         - path:
             type: PathPrefix
             value: /
       backendRefs:
-        - name: ray-controller
+        - name: dolev-rl-controller
           port: 80

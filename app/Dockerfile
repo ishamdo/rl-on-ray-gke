@@ -1,18 +1,30 @@
 # Single image for BOTH the controller Deployment and the RayCluster head/worker
 # pods. Basing on the official Ray image guarantees the Ray Client (driver) and
 # the cluster run the exact same Ray version.
-FROM rayproject/ray:2.40.0-py311
+FROM rayproject/ray:2.40.0-py311-gpu
 
+USER root
+RUN mkdir -p /app && chown -R ray:users /app
+USER ray
 WORKDIR /app
 
-# Ray + numpy are already in the base image; add only the controller extras.
+# Ray + numpy are already in the base image; add only the controller extras and PyTorch.
 # (Kept separate from requirements.txt so we don't reinstall/risk bumping Ray.)
 RUN pip install --no-cache-dir \
     "fastapi==0.115.6" \
     "uvicorn[standard]==0.34.0" \
     "pydantic==2.10.4" \
     "pillow==11.0.0" \
-    "kubernetes==31.0.0"
+    "kubernetes==31.0.0" \
+    "torch==2.3.1" \
+    "transformers==4.46.3" \
+    "peft==0.13.2" \
+    "accelerate==1.1.1" \
+    "pandas" \
+    "pyarrow" \
+    "verl" \
+    "protobuf==3.20.3"
+
 
 # Application code + the playroom UI. Build context is the REPO ROOT (so the
 # frontend/ dir, a sibling of app/, can be baked in for standalone UI serving).
@@ -20,7 +32,8 @@ RUN pip install --no-cache-dir \
 # copy files owned by ray — otherwise they land as root and ray can't read them
 # (uvicorn/import fails with PermissionError). PYTHONPATH=/app makes `tasks`
 # importable on the Ray workers (same image), so render_tile is cluster-wide.
-COPY --chown=ray:users app/tasks.py app/controller.py ./
+COPY --chown=ray:users app/tasks.py app/controller.py app/verl_run.py app/download_gsm8k.py ./
+RUN python3 download_gsm8k.py
 COPY --chown=ray:users frontend ./frontend
 ENV PYTHONPATH=/app
 
