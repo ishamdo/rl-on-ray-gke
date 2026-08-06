@@ -18,6 +18,59 @@ Browser ──/start──▶ Controller (Ray driver) ──ray://head:10001─�
 - **GRPO Advantages:** computes relative advantages within the rollout group to reinforce correct logical paths and penalize incorrect ones without requiring a separate critic network.
 - **Streaming:** the controller streams steps, completions, loss, and rewards in real time to the browser over Server-Sent Events (SSE).
 
+## Core GRPO Ray Actor Implementation
+
+At the heart of the demo is a Ray Actor class annotated with `@ray.remote(num_gpus=1)`. This forces KubeRay to schedule the actor on a dedicated GPU worker pod, triggering GKE Spot GPU node auto-provisioning under load:
+
+```python
+import ray
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+@ray.remote(num_gpus=1)
+class RLTrainer:
+    def __init__(self, model_name: str, lr: float):
+        self.device = "cuda"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Load model on GPU with float16/LoRA adapters
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(self.device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+
+    def train_step(self, prompt: str, target_answer: str, group_size: int):
+        # 1. Rollout: Generate multiple answers (trajectories) for the same prompt
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        repeated_ids = prompt_ids.repeat(group_size, 1)
+        
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                repeated_ids,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.8
+            )
+
+        # 2. Extract rewards & compute relative advantages within the group
+        rewards = []
+        for out in outputs:
+            completion = self.tokenizer.decode(out[prompt_ids.shape[1]:], skip_special_tokens=True)
+            rewards.append(self.evaluate_math_answer(completion, target_answer)) # 1.0 or 0.0
+            
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        mean_r = rewards_tensor.mean()
+        std_r = rewards_tensor.std()
+        advantages = (rewards_tensor - mean_r) / (std_r + 1e-6)
+
+        # 3. Policy Update: Compute GRPO policy loss and update weights
+        self.model.train()
+        loss = self.compute_grpo_loss(outputs, advantages)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return rewards, loss.item()
+```
+
 ## Layout
 
 | Path | Purpose |
