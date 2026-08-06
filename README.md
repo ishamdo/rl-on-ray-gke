@@ -2,7 +2,7 @@
 
 Distributed **GRPO (Group Relative Policy Optimization)** reinforcement learning alignment loop on **KubeRay / GKE**. Pick a model, set the training hyperparameters, hit **Start**, and watch the model learn to solve grade-school arithmetic problems from the `GSM8K` dataset in real time—while a live **metrics dashboard** shows the loss decreasing and rewards (accuracy) climbing as Ray autoscales GPU worker pods onto **Spot L4 GPU nodes**.
 
-This is a [gke_all](https://github.com/ragoler/gke_all) showcase feature (`feature.yaml`). It runs **standalone** and as a **Hub feature**. See [DASHBOARD.md](DASHBOARD.md) for live training metrics and GRPO advantage analysis.
+See [DASHBOARD.md](DASHBOARD.md) for live training metrics and GRPO advantage analysis.
 
 ## How it works
 
