@@ -210,28 +210,40 @@ function drawCharts() {
     return;
   }
   
-  // Draw Accuracy (Reward) - Top half (scales 0.0 to 1.0)
+  // Draw Accuracy (Reward) - Top half (scales 0.0 to 1.0, smoothed with EMA)
   ctx.strokeStyle = "#10b981"; // emerald green
   ctx.lineWidth = 3;
   ctx.beginPath();
+  let smoothedReward = 0;
   for (let i = 0; i < len; i++) {
     const x = (i / (len - 1)) * w;
-    const val = metricsHistory.reward[i];
-    const y = (h / 2) - 15 - val * (h / 2 - 35);
+    const rawVal = metricsHistory.reward[i];
+    if (i === 0) {
+      smoothedReward = rawVal;
+    } else {
+      smoothedReward = 0.5 * rawVal + 0.5 * smoothedReward; // EMA smoothing (alpha = 0.5)
+    }
+    const y = (h / 2) - 15 - smoothedReward * (h / 2 - 35);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
   ctx.stroke();
   
-  // Draw Loss - Bottom half
+  // Draw Loss - Bottom half (smoothed with EMA)
   ctx.strokeStyle = "#f43f5e"; // rose/red
   ctx.lineWidth = 3;
   ctx.beginPath();
   const maxLoss = Math.max(...metricsHistory.loss, 0.5);
+  let smoothedLoss = 0;
   for (let i = 0; i < len; i++) {
     const x = (i / (len - 1)) * w;
-    const val = metricsHistory.loss[i];
-    const y = h - 15 - (val / maxLoss) * (h / 2 - 35);
+    const rawVal = metricsHistory.loss[i];
+    if (i === 0) {
+      smoothedLoss = rawVal;
+    } else {
+      smoothedLoss = 0.5 * rawVal + 0.5 * smoothedLoss; // EMA smoothing (alpha = 0.5)
+    }
+    const y = h - 15 - (smoothedLoss / maxLoss) * (h / 2 - 35);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }

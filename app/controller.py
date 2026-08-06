@@ -329,7 +329,7 @@ def _run_training(model_name: str, framework: str, lr: float, batch_size: int, g
 class TrainRequest(BaseModel):
     model_name: str = Field(default=DEFAULT_MODEL)
     framework: str = Field(default="custom")
-    lr: float = Field(default=5e-5, ge=1e-6, le=1e-3)
+    lr: float = Field(default=1e-5, ge=1e-6, le=1e-3)
     batch_size: int = Field(default=2, ge=1, le=8)
     group_size: int = Field(default=4, ge=2, le=8)
 
