@@ -17,6 +17,24 @@ We ran a **6-step training sequence** using the `Qwen/Qwen2.5-1.5B-Instruct` mod
 | **5** | Tomato harvest fractions | **62.50%** | 0.9725 | 9.3s | `worker-k2cdw` (Spot L4 GPU) |
 | **6** | Dan's ice cream giveaways | **31.25%** | 0.2279 | 9.3s | `worker-k2cdw` (Spot L4 GPU) |
 
+### Visualized Training Curves
+
+```mermaid
+xychart-beta
+    title "Average Batch Reward (Accuracy) Over Steps"
+    x-axis ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6"]
+    y-axis "Accuracy" 0 --> 1.0
+    line [0.4375, 0.0, 0.5, 0.4375, 0.625, 0.3125]
+```
+
+```mermaid
+xychart-beta
+    title "GRPO Policy Loss Over Steps"
+    x-axis ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6"]
+    y-axis "Policy Loss" -0.2 --> 1.2
+    line [0.2430, 0.0, 0.0, -0.0934, 0.9725, 0.2279]
+```
+
 ---
 
 ## 2. Why is the Accuracy Behaving This Way?
