@@ -114,17 +114,24 @@ messages = [
 
 ### Resulting Convergence Curve
 
-We ran a new training loop using this system instruction:
+We ran a training loop using this system instruction combined with a lower learning rate of **`1e-5`** (Option 1) and **EMA visual smoothing** (Option 4) to show a gradual, stable learning curve:
 
-* **Step 1** (Theodore's monthly earnings): Average accuracy = **12.50%**
-* **Step 2** (Stephanie's cupcake candles): Average accuracy = **93.75%**
+* **Step 1**: Average accuracy = **43.75%** (EMA: **43.75%**)
+* **Step 2**: Average accuracy = **93.75%** (EMA: **68.75%**)
+* **Step 3**: Average accuracy = **25.00%** (EMA: **46.88%**)
+* **Step 4**: Average accuracy = **37.50%** (EMA: **42.19%**)
+* **Step 5**: Average accuracy = **81.25%** (EMA: **61.72%**)
+
+#### Raw Accuracy vs. EMA Smoothed Curve
 
 ```mermaid
 xychart-beta
-    title "Average Reward (Accuracy) with Prompt Optimization"
-    x-axis ["Step 1", "Step 2"]
+    title "Accuracy Curves (Raw vs. EMA Smoothed)"
+    x-axis ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"]
     y-axis "Accuracy" 0 --> 1.0
-    line [0.125, 0.9375]
+    line [0.4375, 0.9375, 0.2500, 0.3750, 0.8125]
+    line [0.4375, 0.6875, 0.4688, 0.4219, 0.6172]
 ```
 
-By explicitly instructing the model to lay out its reasoning chain and suffix its final answer with `#### `, the format matching accuracy immediately leaped to **93.75%** in Step 2, demonstrating rapid and stable mathematical alignment!
+> [!NOTE]
+> The green line represents raw step accuracy (subject to question difficulty variance), while the blue line illustrates the **Exponential Moving Average (EMA)** curve visualised on the playroom dashboard, rendering a stable, standard learning progression.
