@@ -79,8 +79,11 @@ class RLTrainer:
             question = sample["question"]
             target_answer = sample["answer"]
 
-            # Chat formatting for Qwen
-            messages = [{"role": "user", "content": question}]
+            # Chat formatting for Qwen with explicit formatting instructions
+            messages = [
+                {"role": "system", "content": "You are a math tutor. Solve the following grade-school math problem step-by-step. Write out your reasoning clearly, and end your response by stating the final numerical answer on a new line with the prefix '#### ', like this: #### <number>"},
+                {"role": "user", "content": question}
+            ]
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
             # Tokenize prompt
