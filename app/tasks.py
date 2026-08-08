@@ -200,6 +200,11 @@ class RLTrainer:
                 ]
             })
 
+            # Explicit memory cleanup to prevent accumulation in Ray Plasma store and GPU VRAM
+            del outputs, batch_inputs, batch_labels, shift_logits, shift_labels, loss, token_log_probs, seq_log_probs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         self.step_count += 1
         avg_loss = all_loss / len(samples)
         avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0

@@ -54,5 +54,5 @@ spec:
             periodSeconds: 15
           resources:
             # 1+ CPU keeps the Ray import (and renders) from being throttled.
-            requests: { cpu: "500m", memory: 512Mi }
-            limits: { cpu: "2", memory: 2Gi }
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "2", memory: 4Gi }
