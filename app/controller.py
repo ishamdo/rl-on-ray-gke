@@ -267,8 +267,17 @@ def _run_custom(model_name: str, lr: float, batch_size: int, group_size: int) ->
                     break
 
             start_time = time.time()
-            step_ref = _TRAINER_ACTOR.train_step.remote(batch_size=batch_size, group_size=group_size)
-            result = ray.get(step_ref)
+            try:
+                step_ref = _TRAINER_ACTOR.train_step.remote(batch_size=batch_size, group_size=group_size)
+                result = ray.get(step_ref)
+            except Exception as e:
+                with _STATE_LOCK:
+                    if not _TRAINING_ACTIVE:
+                        break
+                    _LOGS.append(f"[{time.strftime('%X')}] Spot GPU node preempted or restarted ({e}). Re-instantiating RLTrainer on replacement Spot node...")
+                time.sleep(5)
+                _TRAINER_ACTOR = RLTrainer.options(num_gpus=1).remote(model_name=model_name, lr=lr)
+                continue
             elapsed = time.time() - start_time
 
             with _STATE_LOCK:
@@ -330,8 +339,8 @@ class TrainRequest(BaseModel):
     model_name: str = Field(default=DEFAULT_MODEL)
     framework: str = Field(default="custom")
     lr: float = Field(default=1e-5, ge=1e-6, le=1e-3)
-    batch_size: int = Field(default=2, ge=1, le=8)
-    group_size: int = Field(default=4, ge=2, le=8)
+    batch_size: int = Field(default=8, ge=1, le=32)
+    group_size: int = Field(default=8, ge=2, le=16)
 
 
 # --------------------------------------------------------------------------- #
